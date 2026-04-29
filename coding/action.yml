@@ -1,0 +1,123 @@
+name: 'Coffree Coding Job (dummy runner)'
+description: |
+  Minimal dummy runner that exercises the coffree job HTTP contract end-to-end
+  by calling render -> progress (1 event) -> heartbeat (1 beat) -> complete in
+  sequence with curl. No real agent is started and no MCP / credential / shim
+  setup is performed; this is the smallest composite action that drives a job
+  through the server-side lifecycle defined in
+  docs/specs/job-execution/job-execution.md and progress-reporting.md
+  (coffree-ai/coffree PR #67 implements the four endpoints).
+
+  Production runtime (TypeScript binary, agent SDK adapters, credential proxy /
+  shims, OIDC token exchange) lands in later P4.x slices. Until then this dummy
+  runner is what the dispatch path (P4.3, workflow_dispatch + OIDC) targets so
+  the server side can be observed end-to-end.
+
+inputs:
+  job_id:
+    description: 'Job ID issued by coffree server (workflow_dispatch input).'
+    required: true
+  server_url:
+    description: |
+      Coffree server URL: scheme + host, no trailing slash.
+      Example: https://coffree.example.com
+    required: true
+  job_token:
+    description: |
+      job_token issued by coffree server. In production this is obtained via
+      OIDC token exchange (auth/overview.md runner authentication, gha-runtime
+      §4.4). Until P4.3 lands the exchange step the caller passes the token
+      directly per gha-runtime §4.3.
+    required: true
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Register job_token as a log mask
+      shell: bash
+      env:
+        COFFREE_JOB_TOKEN: ${{ inputs.job_token }}
+      run: |
+        set -euo pipefail
+        # ::add-mask:: registers the value with the runner's log scrubber so
+        # any later log line containing the token is replaced with ***.
+        echo "::add-mask::${COFFREE_JOB_TOKEN}"
+
+    - name: Render job
+      shell: bash
+      env:
+        COFFREE_SERVER_URL: ${{ inputs.server_url }}
+        COFFREE_JOB_ID: ${{ inputs.job_id }}
+        COFFREE_JOB_TOKEN: ${{ inputs.job_token }}
+      run: |
+        set -euo pipefail
+        echo "[render] POST ${COFFREE_SERVER_URL}/jobs/${COFFREE_JOB_ID}/render"
+        # --data-binary '' sends an explicit zero-byte body so curl emits a
+        # POST with Content-Length: 0; the route does not parse the body.
+        curl --fail-with-body -sS -X POST \
+          -H "Authorization: Bearer ${COFFREE_JOB_TOKEN}" \
+          -H "Content-Type: application/json" \
+          --data-binary '' \
+          "${COFFREE_SERVER_URL}/jobs/${COFFREE_JOB_ID}/render"
+        echo
+
+    - name: Send progress event
+      shell: bash
+      env:
+        COFFREE_SERVER_URL: ${{ inputs.server_url }}
+        COFFREE_JOB_ID: ${{ inputs.job_id }}
+        COFFREE_JOB_TOKEN: ${{ inputs.job_token }}
+      run: |
+        set -euo pipefail
+        # Single assistant_message event. payload is a JSON string per the
+        # progress API contract (events[].payload is the wire shape).
+        body='{"events":[{"type":"assistant_message","payload":"{\"text\":\"dummy runner: hello\"}"}]}'
+        echo "[progress] POST ${COFFREE_SERVER_URL}/jobs/${COFFREE_JOB_ID}/progress"
+        # --data-binary preserves the body byte-for-byte and lets curl set
+        # Content-Length, which the server requires (411 length_required if
+        # absent / chunked).
+        curl --fail-with-body -sS -X POST \
+          -H "Authorization: Bearer ${COFFREE_JOB_TOKEN}" \
+          -H "Content-Type: application/json" \
+          --data-binary "${body}" \
+          "${COFFREE_SERVER_URL}/jobs/${COFFREE_JOB_ID}/progress"
+        echo
+
+    - name: Send heartbeat
+      shell: bash
+      env:
+        COFFREE_SERVER_URL: ${{ inputs.server_url }}
+        COFFREE_JOB_ID: ${{ inputs.job_id }}
+        COFFREE_JOB_TOKEN: ${{ inputs.job_token }}
+      run: |
+        set -euo pipefail
+        body='{"current_step":"dummy"}'
+        echo "[heartbeat] PATCH ${COFFREE_SERVER_URL}/jobs/${COFFREE_JOB_ID}/heartbeat"
+        curl --fail-with-body -sS -X PATCH \
+          -H "Authorization: Bearer ${COFFREE_JOB_TOKEN}" \
+          -H "Content-Type: application/json" \
+          --data-binary "${body}" \
+          "${COFFREE_SERVER_URL}/jobs/${COFFREE_JOB_ID}/heartbeat"
+        echo
+
+    - name: Complete job (success)
+      shell: bash
+      env:
+        COFFREE_SERVER_URL: ${{ inputs.server_url }}
+        COFFREE_JOB_ID: ${{ inputs.job_id }}
+        COFFREE_JOB_TOKEN: ${{ inputs.job_token }}
+      run: |
+        set -euo pipefail
+        # decline_next_job=true keeps the new row (if routing produces one)
+        # in 'pending' so the regular dispatch path picks it up. Production
+        # complete route also forces decline when no mintJobToken is wired,
+        # so this matches today's server-side behaviour.
+        request_id=$(cat /proc/sys/kernel/random/uuid)
+        body=$(printf '{"request_id":"%s","success":true,"outcome":"completed","steps_completed":1,"steps_total":1,"decline_next_job":true}' "${request_id}")
+        echo "[complete] PATCH ${COFFREE_SERVER_URL}/jobs/${COFFREE_JOB_ID}/complete"
+        curl --fail-with-body -sS -X PATCH \
+          -H "Authorization: Bearer ${COFFREE_JOB_TOKEN}" \
+          -H "Content-Type: application/json" \
+          --data-binary "${body}" \
+          "${COFFREE_SERVER_URL}/jobs/${COFFREE_JOB_ID}/complete"
+        echo
