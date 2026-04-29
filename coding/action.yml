@@ -107,7 +107,8 @@ runs:
           '{oidc_token: $t, job_id: $j}')
 
         # Retry policy per gha-runtime.md §4.4:
-        #   500 / 503 -> retry (max 3 attempts, exponential backoff 1s, 2s, 4s)
+        #   500 / 503 -> retry up to 3 times after the initial attempt
+        #     (4 attempts total, sleeping 1s, 2s, 4s between them)
         #   400 / 401 / 403 / 404 / 411 / 413 -> non-retryable, exit immediately
         # Network-layer failure (curl non-zero) is treated as immediate exit
         # because the spec's retry table only covers HTTP status codes.
@@ -116,7 +117,7 @@ runs:
         trap "rm -f '${response_file}'" EXIT
 
         attempt=0
-        max_attempts=3
+        max_attempts=4
         backoff=1
         job_token=""
         while :; do

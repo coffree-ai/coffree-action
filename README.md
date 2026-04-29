@@ -75,8 +75,9 @@ inconvenient; production should leave `job_token` empty.
 Mirrors the table in
 [`gha-runtime.md` §4.4](https://github.com/coffree-ai/coffree/blob/main/docs/specs/job-execution/gha-runtime.md):
 
-- `500` / `503` from `/auth/exchange-token`: retried up to 3 times with
-  exponential backoff (1s, 2s, 4s) before failing the step.
+- `500` / `503` from `/auth/exchange-token`: retried up to 3 times after
+  the initial attempt (4 attempts in total, sleeping 1s, 2s, 4s between
+  them) before failing the step.
 - `400` / `401` / `403` / `404` / `411` / `413`: non-retryable, the step
   exits immediately with the response body printed.
 - Missing `ACTIONS_ID_TOKEN_REQUEST_URL` / `ACTIONS_ID_TOKEN_REQUEST_TOKEN`
