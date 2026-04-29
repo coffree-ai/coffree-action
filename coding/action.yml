@@ -8,10 +8,14 @@ description: |
   docs/specs/job-execution/job-execution.md and progress-reporting.md
   (coffree-ai/coffree PR #67 implements the four endpoints).
 
+  When `job_token` is not supplied the action acquires one by exchanging a GHA
+  OIDC token at `${server_url}/auth/exchange-token`
+  (docs/specs/job-execution/gha-runtime.md §4.4). Production callers should
+  leave `job_token` empty; only test / development paths pre-set it
+  (gha-runtime.md §4.3).
+
   Production runtime (TypeScript binary, agent SDK adapters, credential proxy /
-  shims, OIDC token exchange) lands in later P4.x slices. Until then this dummy
-  runner is what the dispatch path (P4.3, workflow_dispatch + OIDC) targets so
-  the server side can be observed end-to-end.
+  shims) lands in later P4.x slices.
 
 inputs:
   job_id:
@@ -21,36 +25,162 @@ inputs:
     description: |
       Coffree server URL: scheme + host, no trailing slash.
       Example: https://coffree.example.com
+      Used both as the exchange-token endpoint host and as the OIDC audience
+      (server-side audience check requires exact match per
+      docs/specs/auth/overview.md runner 認証).
     required: true
   job_token:
     description: |
-      job_token issued by coffree server. In production this is obtained via
-      OIDC token exchange (auth/overview.md runner authentication, gha-runtime
-      §4.4). Until P4.3 lands the exchange step the caller passes the token
-      directly per gha-runtime §4.3.
-    required: true
+      Optional pre-issued job_token for testing / development. When omitted
+      (or empty) the action exchanges a GHA OIDC token at
+      `${server_url}/auth/exchange-token` (gha-runtime.md §4.4). When
+      supplied the OIDC exchange is skipped and the value is used as-is
+      (gha-runtime.md §4.3). Production callers should leave this empty and
+      add `permissions: id-token: write` to the workflow.
+    required: false
+    default: ''
 
 runs:
   using: 'composite'
   steps:
-    - name: Register job_token as a log mask
+    - name: Acquire job_token (test override or OIDC exchange)
       shell: bash
       env:
-        COFFREE_JOB_TOKEN: ${{ inputs.job_token }}
+        COFFREE_SERVER_URL: ${{ inputs.server_url }}
+        COFFREE_JOB_ID: ${{ inputs.job_id }}
+        COFFREE_JOB_TOKEN_INPUT: ${{ inputs.job_token }}
       run: |
         set -euo pipefail
-        # ::add-mask:: registers the value with the runner's log scrubber so
-        # any later log line containing the token is replaced with ***.
-        echo "::add-mask::${COFFREE_JOB_TOKEN}"
+
+        # Test fallback (gha-runtime.md §4.3): caller passes job_token
+        # directly. Mask and propagate via $GITHUB_ENV so subsequent steps
+        # in this composite action read it from the environment.
+        if [ -n "${COFFREE_JOB_TOKEN_INPUT}" ]; then
+          echo "[acquire] using job_token from inputs (test fallback per gha-runtime §4.3)"
+          echo "::add-mask::${COFFREE_JOB_TOKEN_INPUT}"
+          echo "COFFREE_JOB_TOKEN=${COFFREE_JOB_TOKEN_INPUT}" >> "${GITHUB_ENV}"
+          exit 0
+        fi
+
+        echo "[acquire] exchanging GHA OIDC token at ${COFFREE_SERVER_URL}/auth/exchange-token"
+
+        # ACTIONS_ID_TOKEN_REQUEST_{URL,TOKEN} are populated by the runner
+        # only when the workflow declares `permissions: id-token: write`
+        # (gha-runtime.md §4.4 error table).
+        oidc_url="${ACTIONS_ID_TOKEN_REQUEST_URL:-}"
+        oidc_request_token="${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}"
+        if [ -z "${oidc_url}" ] && [ -z "${oidc_request_token}" ]; then
+          echo "::error::GHA OIDC is not available. Add 'permissions: id-token: write' to the workflow that calls this action."
+          exit 1
+        fi
+        if [ -z "${oidc_url}" ]; then
+          echo "::error::ACTIONS_ID_TOKEN_REQUEST_URL is missing while ACTIONS_ID_TOKEN_REQUEST_TOKEN is present."
+          exit 1
+        fi
+        if [ -z "${oidc_request_token}" ]; then
+          echo "::error::ACTIONS_ID_TOKEN_REQUEST_TOKEN is missing while ACTIONS_ID_TOKEN_REQUEST_URL is present."
+          exit 1
+        fi
+
+        # The OIDC request URL already carries a query string, so append
+        # `&audience=...`. Audience must equal the server's PUBLIC_URL
+        # (scheme + host, no trailing slash) so the JWT `aud` claim matches
+        # exactly on the server (auth/overview.md runner 認証 step 5).
+        oidc_response=$(curl --fail-with-body -sS \
+          -H "Authorization: bearer ${oidc_request_token}" \
+          "${oidc_url}&audience=${COFFREE_SERVER_URL}") || {
+          echo "::error::Failed to fetch OIDC token from the GHA OIDC provider."
+          exit 1
+        }
+        oidc_token=$(printf '%s' "${oidc_response}" | jq -r '.value // empty')
+        if [ -z "${oidc_token}" ]; then
+          echo "::error::OIDC token response did not contain a 'value' field."
+          exit 1
+        fi
+        # Mask the OIDC token before any subsequent log line could expose it.
+        echo "::add-mask::${oidc_token}"
+
+        # Build exchange-token request body via jq for safe JSON escaping.
+        request_body=$(jq -cn \
+          --arg t "${oidc_token}" \
+          --arg j "${COFFREE_JOB_ID}" \
+          '{oidc_token: $t, job_id: $j}')
+
+        # Retry policy per gha-runtime.md §4.4:
+        #   500 / 503 -> retry (max 3 attempts, exponential backoff 1s, 2s, 4s)
+        #   400 / 401 / 403 / 404 / 411 / 413 -> non-retryable, exit immediately
+        # Network-layer failure (curl non-zero) is treated as immediate exit
+        # because the spec's retry table only covers HTTP status codes.
+        response_file="$(mktemp)"
+        # shellcheck disable=SC2064
+        trap "rm -f '${response_file}'" EXIT
+
+        attempt=0
+        max_attempts=3
+        backoff=1
+        job_token=""
+        while :; do
+          attempt=$((attempt + 1))
+          http_status=$(curl -sS -o "${response_file}" -w '%{http_code}' \
+            -X POST \
+            -H "Content-Type: application/json" \
+            --data-binary "${request_body}" \
+            "${COFFREE_SERVER_URL}/auth/exchange-token") || {
+            echo "::error::curl failed to reach ${COFFREE_SERVER_URL}/auth/exchange-token."
+            exit 1
+          }
+
+          if [ "${http_status}" = "200" ]; then
+            job_token=$(jq -r '.job_token // empty' < "${response_file}")
+            if [ -z "${job_token}" ]; then
+              echo "::error::exchange-token returned 200 but the body did not contain 'job_token'."
+              exit 1
+            fi
+            break
+          fi
+
+          case "${http_status}" in
+            400|401|403|404|411|413)
+              echo "::error::exchange-token returned ${http_status} (non-retryable per gha-runtime §4.4):"
+              cat "${response_file}" || true
+              exit 1
+              ;;
+            500|503)
+              if [ "${attempt}" -ge "${max_attempts}" ]; then
+                echo "::error::exchange-token returned ${http_status} on attempt ${attempt}/${max_attempts} (giving up):"
+                cat "${response_file}" || true
+                exit 1
+              fi
+              echo "[acquire] exchange-token returned ${http_status}, retrying in ${backoff}s (attempt ${attempt}/${max_attempts})"
+              cat "${response_file}" || true
+              sleep "${backoff}"
+              backoff=$((backoff * 2))
+              ;;
+            *)
+              echo "::error::exchange-token returned unexpected status ${http_status}:"
+              cat "${response_file}" || true
+              exit 1
+              ;;
+          esac
+        done
+
+        # Mask the issued job_token before publishing it via $GITHUB_ENV.
+        # The runner does not log values written to GITHUB_ENV, but
+        # registering the mask now scrubs any later log line that happens
+        # to contain the token (e.g. an HTTP error body from a downstream
+        # endpoint).
+        echo "::add-mask::${job_token}"
+        echo "COFFREE_JOB_TOKEN=${job_token}" >> "${GITHUB_ENV}"
+        echo "[acquire] job_token obtained via OIDC exchange"
 
     - name: Render job
       shell: bash
       env:
         COFFREE_SERVER_URL: ${{ inputs.server_url }}
         COFFREE_JOB_ID: ${{ inputs.job_id }}
-        COFFREE_JOB_TOKEN: ${{ inputs.job_token }}
       run: |
         set -euo pipefail
+        : "${COFFREE_JOB_TOKEN:?COFFREE_JOB_TOKEN is not set; the Acquire step did not run}"
         echo "[render] POST ${COFFREE_SERVER_URL}/jobs/${COFFREE_JOB_ID}/render"
         # --data-binary '' sends an explicit zero-byte body so curl emits a
         # POST with Content-Length: 0; the route does not parse the body.
@@ -66,9 +196,9 @@ runs:
       env:
         COFFREE_SERVER_URL: ${{ inputs.server_url }}
         COFFREE_JOB_ID: ${{ inputs.job_id }}
-        COFFREE_JOB_TOKEN: ${{ inputs.job_token }}
       run: |
         set -euo pipefail
+        : "${COFFREE_JOB_TOKEN:?COFFREE_JOB_TOKEN is not set; the Acquire step did not run}"
         # Single assistant_message event. payload is a JSON string per the
         # progress API contract (events[].payload is the wire shape).
         body='{"events":[{"type":"assistant_message","payload":"{\"text\":\"dummy runner: hello\"}"}]}'
@@ -88,9 +218,9 @@ runs:
       env:
         COFFREE_SERVER_URL: ${{ inputs.server_url }}
         COFFREE_JOB_ID: ${{ inputs.job_id }}
-        COFFREE_JOB_TOKEN: ${{ inputs.job_token }}
       run: |
         set -euo pipefail
+        : "${COFFREE_JOB_TOKEN:?COFFREE_JOB_TOKEN is not set; the Acquire step did not run}"
         body='{"current_step":"dummy"}'
         echo "[heartbeat] PATCH ${COFFREE_SERVER_URL}/jobs/${COFFREE_JOB_ID}/heartbeat"
         curl --fail-with-body -sS -X PATCH \
@@ -105,9 +235,9 @@ runs:
       env:
         COFFREE_SERVER_URL: ${{ inputs.server_url }}
         COFFREE_JOB_ID: ${{ inputs.job_id }}
-        COFFREE_JOB_TOKEN: ${{ inputs.job_token }}
       run: |
         set -euo pipefail
+        : "${COFFREE_JOB_TOKEN:?COFFREE_JOB_TOKEN is not set; the Acquire step did not run}"
         # decline_next_job=true keeps the new row (if routing produces one)
         # in 'pending' so the regular dispatch path picks it up. Production
         # complete route also forces decline when no mintJobToken is wired,
