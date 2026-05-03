@@ -1,0 +1,50 @@
+name: static-smoke
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  smoke:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: actionlint
+        uses: raven-actions/actionlint@v2
+        with:
+          flags: -shellcheck=
+
+      - name: yaml parse
+        run: |
+          set -euo pipefail
+          python3 -c 'import sys, yaml; yaml.safe_load(open("coding/action.yml"))'
+          echo "[smoke] coding/action.yml parses as YAML"
+
+      - name: bash -n + shellcheck per step
+        run: |
+          set -euo pipefail
+          # Extract each composite step's `run:` block and validate it with
+          # `bash -n` (parse-only) and shellcheck. The yq extraction strips
+          # YAML indentation so the body is a self-contained shell script.
+          which yq || { sudo wget -q -O /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 && sudo chmod +x /usr/local/bin/yq; }
+          step_count=$(yq '.runs.steps | length' coding/action.yml)
+          for i in $(seq 0 $((step_count - 1))); do
+            name=$(yq ".runs.steps[$i].name" coding/action.yml)
+            run=$(yq ".runs.steps[$i].run" coding/action.yml)
+            if [ "${run}" = "null" ]; then
+              echo "[smoke] step ${i} (${name}) has no \`run\` block; skipping"
+              continue
+            fi
+            tmp=$(mktemp)
+            printf '%s\n' "${run}" > "${tmp}"
+            echo "[smoke] step ${i}: ${name}"
+            bash -n "${tmp}"
+            shellcheck --shell=bash --severity=warning "${tmp}" || {
+              echo "::error::shellcheck failed for step ${i}: ${name}"
+              exit 1
+            }
+            rm -f "${tmp}"
+          done
+          echo "[smoke] all composite steps passed bash -n + shellcheck"
