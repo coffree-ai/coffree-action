@@ -51,6 +51,12 @@ runs:
         TOKEN_FILE="${RUNNER_TEMP}/coffree-tokens/tokens.json"
         CAPS_FILE="${RUNNER_TEMP}/coffree-tokens/capabilities.json"
 
+        # Install the cleanup trap BEFORE any guard exits. rm -f is silent
+        # on missing files so this is safe to fire even if the files do not
+        # yet exist (gha-runtime.md §3.5: "read then immediate delete").
+        # shellcheck disable=SC2064
+        trap "rm -f -- '${TOKEN_FILE}' '${CAPS_FILE}'" EXIT
+
         if [ ! -f "${TOKEN_FILE}" ]; then
           echo "::error::Missing ${TOKEN_FILE}; api-proxy service container did not write tokens.json. Check that ghcr.io/coffree-ai/api-proxy is healthy and that services.api-proxy.volumes mounts \${{ runner.temp }}/coffree-tokens:/tokens (gha-runtime.md §2.1 §3.5)."
           exit 1
@@ -60,17 +66,29 @@ runs:
           exit 1
         fi
 
-        # Ensure both files are removed before the agent runs even if a
-        # later validation step fails (gha-runtime.md §3.5: "read then
-        # immediate delete"). The success path also removes them
-        # explicitly below; the trap is a defensive backstop.
-        # shellcheck disable=SC2064
-        trap "rm -f '${TOKEN_FILE}' '${CAPS_FILE}'" EXIT
-
         api_proxy_token=$(jq -r '.api_proxy_token // empty' "${TOKEN_FILE}")
         credential_proxy_token=$(jq -r '.credential_proxy_token // empty' "${TOKEN_FILE}")
         api_proxy_url=$(jq -r '.api_proxy_url // empty' "${CAPS_FILE}")
-        saas_providers=$(jq -r '.providers | join(",")' "${CAPS_FILE}")
+        # Validate the providers array shape AND each element against the
+        # allowlist via jq before joining. jq -e exits non-zero on the
+        # `error()` call, which trips `set -e`. Using jq (not bash regex)
+        # means we type-assert that providers is an array of strings.
+        saas_providers=$(jq -er '
+          if (.providers|type) != "array" then
+            error("capabilities.providers must be an array")
+          else
+            .providers
+            | map(
+                if (type == "string" and (. == "anthropic" or . == "openai" or . == "google"))
+                then .
+                else error("invalid provider: " + tostring) end
+              )
+            | join(",")
+          end
+        ' "${CAPS_FILE}") || {
+          echo "::error::Invalid providers in capabilities.json (allowlist: anthropic / openai / google per credential-isolation.md §2.4)"
+          exit 1
+        }
 
         if [ -z "${api_proxy_token}" ] || [ -z "${credential_proxy_token}" ] || [ -z "${api_proxy_url}" ]; then
           echo "::error::Required token fields missing from tokens.json / capabilities.json (api_proxy_token / credential_proxy_token / api_proxy_url)."
@@ -80,38 +98,27 @@ runs:
         # Validate shapes before propagating. credential_proxy_token will be
         # interpolated into shim shell scripts (credential-isolation.md §4.2);
         # api_proxy_url will be interpolated via sed -e "s|...|${url}|g".
-        # api_proxy_token / saas_providers are written to $GITHUB_ENV.
-        # Restrict each to a tight character class so newline / sed metachar
-        # / shell metachar injection is impossible even if api-proxy ever
-        # writes a malformed JSON value.
-        if ! printf '%s' "${credential_proxy_token}" | grep -qE '^[A-Za-z0-9_-]+$'; then
+        # api_proxy_token is written to $GITHUB_ENV.
+        # Use bash `[[ ... =~ ... ]]` instead of `grep -qE`; bash regex is
+        # whole-string matching so a value containing a newline (e.g.
+        # "abc\nBASH_ENV=/tmp/pwn") fails, while grep would match per line
+        # and let the second line slip into $GITHUB_ENV.
+        token_re='^[A-Za-z0-9_-]+$'
+        if [[ ! ${credential_proxy_token} =~ ${token_re} ]]; then
           echo "::error::credential_proxy_token contains characters outside [A-Za-z0-9_-]"
           exit 1
         fi
-        if ! printf '%s' "${api_proxy_token}" | grep -qE '^[A-Za-z0-9_-]+$'; then
+        if [[ ! ${api_proxy_token} =~ ${token_re} ]]; then
           echo "::error::api_proxy_token contains characters outside [A-Za-z0-9_-]"
           exit 1
         fi
         # api_proxy_url: http(s) scheme + host (alphanum + . + -) + optional
         # :port + optional /path. Excludes sed metachars (| & \ newline) and
         # shell metachars (" ' $ ` ; etc).
-        if ! printf '%s' "${api_proxy_url}" | grep -qE '^https?://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._-]*)*$'; then
+        url_re='^https?://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._-]*)*$'
+        if [[ ! ${api_proxy_url} =~ ${url_re} ]]; then
           echo "::error::api_proxy_url has invalid format: ${api_proxy_url}"
           exit 1
-        fi
-        # saas_providers: comma-separated list of allowlisted provider names
-        # (credential-isolation.md §2.4).
-        if [ -n "${saas_providers}" ]; then
-          IFS=',' read -ra _provs <<<"${saas_providers}"
-          for p in "${_provs[@]}"; do
-            case "${p}" in
-              anthropic|openai|google) ;;
-              *)
-                echo "::error::Unknown provider in capabilities.providers: ${p}"
-                exit 1
-                ;;
-            esac
-          done
         fi
 
         # Mask both tokens before any subsequent log line could expose them.
@@ -403,15 +410,19 @@ runs:
         credential_proxy_token=$(cat "${stage_token_file}")
         api_proxy_url=$(cat "${stage_url_file}")
 
-        # Re-validate post-staging (defence in depth) with the same strict
-        # character classes used in the Acquire step. credential_proxy_token
-        # and api_proxy_url are interpolated into shim scripts via sed; they
-        # must not contain sed metachars (| & \ newline) or shell metachars.
-        if ! printf '%s' "${credential_proxy_token}" | grep -qE '^[A-Za-z0-9_-]+$'; then
+        # Re-validate post-staging with the same strict character classes
+        # used in the Acquire step. Use bash `[[ ... =~ ... ]]` so the
+        # check matches the entire string (not per line); a value with a
+        # newline must fail. credential_proxy_token and api_proxy_url are
+        # interpolated into shim scripts via sed; they must not contain sed
+        # metachars (| & \ newline) or shell metachars.
+        token_re='^[A-Za-z0-9_-]+$'
+        url_re='^https?://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._-]*)*$'
+        if [[ ! ${credential_proxy_token} =~ ${token_re} ]]; then
           echo "::error::credential_proxy_token contains characters outside [A-Za-z0-9_-]"
           exit 1
         fi
-        if ! printf '%s' "${api_proxy_url}" | grep -qE '^https?://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._-]*)*$'; then
+        if [[ ! ${api_proxy_url} =~ ${url_re} ]]; then
           echo "::error::api_proxy_url has invalid format: ${api_proxy_url}"
           exit 1
         fi
@@ -425,13 +436,23 @@ runs:
         gh_real_path=$(command -v gh)
         # gh_real_path will be interpolated into the shim script via sed;
         # require an absolute path with safe characters only.
-        if ! printf '%s' "${gh_real_path}" | grep -qE '^/[A-Za-z0-9._/-]+$'; then
+        gh_path_re='^/[A-Za-z0-9._/-]+$'
+        if [[ ! ${gh_real_path} =~ ${gh_path_re} ]]; then
           echo "::error::gh real path is not a safe absolute path: ${gh_real_path}"
           exit 1
         fi
 
         shim_dir=$(mktemp -d "${RUNNER_TEMP}/coffree-shims-XXXXXX")
         chmod 700 "${shim_dir}"
+
+        # Record SHIM_DIR for the Cleanup step IMMEDIATELY after mktemp so
+        # the post step has it even if any of the shim writes / sed / git
+        # config fails partway through (credential-isolation.md §4.4
+        # cleanup must scope to the action-created shim dir). Stays off
+        # agent env per credential-isolation.md §5.2 denylist
+        # (COFFREE_SHIM_DIR is denied).
+        printf '%s' "${shim_dir}" > "${COFFREE_SHIM_DIR_FILE}"
+        chmod 600 "${COFFREE_SHIM_DIR_FILE}"
 
         # gh shim per credential-isolation.md §4.2 with the gha-runtime.md
         # §4.5 subcommand allowlist (pr / repo / api / issue). The script
@@ -516,11 +537,6 @@ runs:
         # real binary in subsequent steps.
         echo "${shim_dir}" >> "${GITHUB_PATH}"
 
-        # Record SHIM_DIR for the cleanup step. Stays off agent env per
-        # credential-isolation.md §5.2 denylist (COFFREE_SHIM_DIR is denied).
-        printf '%s' "${shim_dir}" > "${COFFREE_SHIM_DIR_FILE}"
-        chmod 600 "${COFFREE_SHIM_DIR_FILE}"
-
         # NB: COFFREE_SHIM_STAGING_DIR is intentionally left in place. The
         # Run coffree step reads credential_proxy_token + api_proxy_url back
         # from it, exports CREDENTIAL_PROXY_URL / CREDENTIAL_PROXY_TOKEN to
@@ -544,39 +560,11 @@ runs:
         set -euo pipefail
 
         # =========================================================
-        # 1. Scrub exported bash functions BEFORE running any external
-        #    command. credential-isolation.md §5.2 / §8 lists the
-        #    BASH_FUNC_ prefix in DENIED_ENV_PREFIXES; an exported function
-        #    in the caller env could otherwise shadow `cat` / `jq` / etc.
-        #    Use builtins (`builtin command`, `compgen`) so a malicious
-        #    function on the same name cannot intercept the scrub.
-        # =========================================================
-        # Collect the raw env names that begin with BASH_FUNC_. `command env`
-        # bypasses any function named `env`; `command awk` does the same for
-        # awk. The names contain shell metachars (`%%` / `()`) and cannot be
-        # passed to `unset` directly, but `env -u` accepts them verbatim and
-        # we save them in an array for the final exec.
-        declare -a _bash_func_unset_args=()
-        while IFS= read -r _raw_name; do
-          [ -n "${_raw_name}" ] || continue
-          _bash_func_unset_args+=(-u "${_raw_name}")
-          # Also drop the function from this shell. `unset -f` requires a
-          # valid identifier, so strip the BASH_FUNC_ prefix and the %% / ()
-          # suffix that bash appends to the env name.
-          _fn_name="${_raw_name#BASH_FUNC_}"
-          _fn_name="${_fn_name%%%%}"
-          _fn_name="${_fn_name%%\(\)}"
-          if [ -n "${_fn_name}" ]; then
-            builtin unset -f -- "${_fn_name}" 2>/dev/null || true
-          fi
-        done < <(command env | command awk -F= '/^BASH_FUNC_/ {sub(/=.*/, "", $0); print}')
-
-        # =========================================================
-        # 2. Scrub the rest of the credential-isolation.md §5.2 denylist
-        #    from the step env. The CLI's buildAgentEnv() strips these
-        #    again when spawning agent subprocesses, but stripping at the
-        #    action layer first defends against caller workflow
-        #    misconfiguration that leaks tokens into the step env.
+        # 1. Scrub the scalar credential-isolation.md §5.2 denylist FIRST,
+        #    using only bash builtins. This must happen before any
+        #    external command runs so that LD_PRELOAD / LD_LIBRARY_PATH
+        #    etc. cannot hijack the dynamic linker for `env` / `awk` /
+        #    `cat` / etc. on the way to the BASH_FUNC enumeration below.
         # =========================================================
         # Keep COFFREE_JOB_TOKEN / COFFREE_AI_PROXY_* / LLM_BASE_URL /
         # LLM_API_KEY / COFFREE_SERVER_URL / COFFREE_JOB_ID — the CLI needs
@@ -600,6 +588,29 @@ runs:
           DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH DYLD_FRAMEWORK_PATH \
           NODE_OPTIONS
 
+        # =========================================================
+        # 2. Scrub exported bash functions (DENIED_ENV_PREFIXES BASH_FUNC_
+        #    per credential-isolation.md §5.2 / §8). Now that LD_PRELOAD
+        #    etc. are unset above, external commands (`env` / `awk`) can
+        #    safely run via `command` (which bypasses any same-named
+        #    bash function). The raw env names contain shell metachars
+        #    (foo%% / foo()) that break `unset`, so we save them in an
+        #    array for the final `exec env "${args[@]}"` and remove the
+        #    function bodies from this shell via `unset -f` after
+        #    stripping the BASH_FUNC_ prefix and metachar suffix.
+        # =========================================================
+        declare -a _bash_func_unset_args=()
+        while IFS= read -r _raw_name; do
+          [ -n "${_raw_name}" ] || continue
+          _bash_func_unset_args+=(-u "${_raw_name}")
+          _fn_name="${_raw_name#BASH_FUNC_}"
+          _fn_name="${_fn_name%%%%}"
+          _fn_name="${_fn_name%%\(\)}"
+          if [ -n "${_fn_name}" ]; then
+            builtin unset -f -- "${_fn_name}" 2>/dev/null || true
+          fi
+        done < <(command env | command awk -F= '/^BASH_FUNC_/ {sub(/=.*/, "", $0); print}')
+
         : "${COFFREE_JOB_TOKEN:?COFFREE_JOB_TOKEN is not set; the OIDC exchange step did not run}"
 
         # =========================================================
@@ -617,13 +628,17 @@ runs:
         credential_proxy_token=$(command cat "${stage_token_file}")
         api_proxy_url=$(command cat "${stage_url_file}")
 
-        # Re-validate post-staging (defence in depth, identical to the
-        # checks in Acquire / Configure shims).
-        if ! command printf '%s' "${credential_proxy_token}" | command grep -qE '^[A-Za-z0-9_-]+$'; then
+        # Re-validate post-staging using bash regex (whole-string match,
+        # not line-oriented like grep -qE). credential_proxy_token and
+        # api_proxy_url must not contain newlines or sed metachars even
+        # at this final read; the api-proxy is trusted but disk is shared.
+        token_re='^[A-Za-z0-9_-]+$'
+        url_re='^https?://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._-]*)*$'
+        if [[ ! ${credential_proxy_token} =~ ${token_re} ]]; then
           echo "::error::credential_proxy_token contains characters outside [A-Za-z0-9_-]"
           exit 1
         fi
-        if ! command printf '%s' "${api_proxy_url}" | command grep -qE '^https?://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._-]*)*$'; then
+        if [[ ! ${api_proxy_url} =~ ${url_re} ]]; then
           echo "::error::api_proxy_url has invalid format: ${api_proxy_url}"
           exit 1
         fi
@@ -670,22 +685,21 @@ runs:
         shim_dir=""
         if [ -f "${COFFREE_SHIM_DIR_FILE}" ]; then
           shim_dir=$(cat "${COFFREE_SHIM_DIR_FILE}")
-          # Validate the recorded path matches an action-created shim dir
-          # (mktemp -d under $RUNNER_TEMP/coffree-shims-XXXXXX) before
-          # rm -rf'ing it, so a tampered file or stale state cannot trick
-          # us into removing an unrelated directory.
-          case "${shim_dir}" in
-            "${RUNNER_TEMP}/coffree-shims-"*)
-              if [ -d "${shim_dir}" ]; then
-                rm -rf -- "${shim_dir}"
-                echo "[cleanup] removed shim dir ${shim_dir}"
-              fi
-              ;;
-            *)
-              echo "[cleanup] refusing to remove unrecognised shim dir: ${shim_dir}"
-              shim_dir=""
-              ;;
-          esac
+          # Validate strictly: parent must equal $RUNNER_TEMP, basename
+          # must match coffree-shims-<alnum> (the mktemp -d template). A
+          # plain prefix `case` would accept path traversal like
+          # ${RUNNER_TEMP}/coffree-shims-x/../etc, so we split parent +
+          # basename via bash parameter expansion and compare each.
+          shim_parent="${shim_dir%/*}"
+          shim_base="${shim_dir##*/}"
+          base_re='^coffree-shims-[A-Za-z0-9]+$'
+          if [ "${shim_parent}" = "${RUNNER_TEMP}" ] && [[ ${shim_base} =~ ${base_re} ]] && [ -d "${shim_dir}" ]; then
+            rm -rf -- "${shim_dir}"
+            echo "[cleanup] removed shim dir ${shim_dir}"
+          else
+            echo "[cleanup] refusing to remove unrecognised shim dir: ${shim_dir}"
+            shim_dir=""
+          fi
           rm -f -- "${COFFREE_SHIM_DIR_FILE}"
         else
           echo "[cleanup] no shim dir to remove (Configure credential shims step did not run)"
