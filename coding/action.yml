@@ -60,6 +60,13 @@ runs:
           exit 1
         fi
 
+        # Ensure both files are removed before the agent runs even if a
+        # later validation step fails (gha-runtime.md §3.5: "read then
+        # immediate delete"). The success path also removes them
+        # explicitly below; the trap is a defensive backstop.
+        # shellcheck disable=SC2064
+        trap "rm -f '${TOKEN_FILE}' '${CAPS_FILE}'" EXIT
+
         api_proxy_token=$(jq -r '.api_proxy_token // empty' "${TOKEN_FILE}")
         credential_proxy_token=$(jq -r '.credential_proxy_token // empty' "${TOKEN_FILE}")
         api_proxy_url=$(jq -r '.api_proxy_url // empty' "${CAPS_FILE}")
@@ -516,11 +523,12 @@ runs:
 
         # NB: COFFREE_SHIM_STAGING_DIR is intentionally left in place. The
         # Run coffree step reads credential_proxy_token + api_proxy_url back
-        # from it and exposes them via inline `export` to the CLI process
-        # only (CLI's credential-resolver.ts requires CREDENTIAL_PROXY_URL /
-        # CREDENTIAL_PROXY_TOKEN in process env per credential-isolation.md
-        # §2.3 / §3.1). The Cleanup credential shims post step removes the
-        # staging dir on `if: always()`.
+        # from it, exports CREDENTIAL_PROXY_URL / CREDENTIAL_PROXY_TOKEN to
+        # the CLI process only (CLI's credential-resolver.ts contract per
+        # credential-isolation.md §2.3 / §3.1), and then deletes the
+        # staging dir before exec'ing the CLI so the credentials do not
+        # live on disk during the agent run. Cleanup credential shims runs
+        # `rm -rf` again as a defensive backstop on `if: always()`.
 
         echo "[shims] gh shim + git credential helper installed at ${shim_dir}"
 
@@ -534,34 +542,48 @@ runs:
         COFFREE_SHIM_STAGING_DIR: ${{ runner.temp }}/coffree-shim-staging
       run: |
         set -euo pipefail
-        : "${COFFREE_JOB_TOKEN:?COFFREE_JOB_TOKEN is not set; the OIDC exchange step did not run}"
 
-        # Read staged credential_proxy_token + api_proxy_url left behind by
-        # Configure credential shims. These are required to build the CLI's
-        # credential resolver (src/cli/run-job/credential-resolver.ts in
-        # coffree-ai/coffree, contract pinned by credential-isolation.md
-        # §2.3 / §3.1).
-        stage_token_file="${COFFREE_SHIM_STAGING_DIR}/credential_proxy_token"
-        stage_url_file="${COFFREE_SHIM_STAGING_DIR}/api_proxy_url"
-        if [ ! -f "${stage_token_file}" ] || [ ! -f "${stage_url_file}" ]; then
-          echo "::error::Missing staged credential proxy state (Configure credential shims step did not run)."
-          exit 1
-        fi
-        credential_proxy_token=$(cat "${stage_token_file}")
-        api_proxy_url=$(cat "${stage_url_file}")
+        # =========================================================
+        # 1. Scrub exported bash functions BEFORE running any external
+        #    command. credential-isolation.md §5.2 / §8 lists the
+        #    BASH_FUNC_ prefix in DENIED_ENV_PREFIXES; an exported function
+        #    in the caller env could otherwise shadow `cat` / `jq` / etc.
+        #    Use builtins (`builtin command`, `compgen`) so a malicious
+        #    function on the same name cannot intercept the scrub.
+        # =========================================================
+        # Collect the raw env names that begin with BASH_FUNC_. `command env`
+        # bypasses any function named `env`; `command awk` does the same for
+        # awk. The names contain shell metachars (`%%` / `()`) and cannot be
+        # passed to `unset` directly, but `env -u` accepts them verbatim and
+        # we save them in an array for the final exec.
+        declare -a _bash_func_unset_args=()
+        while IFS= read -r _raw_name; do
+          [ -n "${_raw_name}" ] || continue
+          _bash_func_unset_args+=(-u "${_raw_name}")
+          # Also drop the function from this shell. `unset -f` requires a
+          # valid identifier, so strip the BASH_FUNC_ prefix and the %% / ()
+          # suffix that bash appends to the env name.
+          _fn_name="${_raw_name#BASH_FUNC_}"
+          _fn_name="${_fn_name%%%%}"
+          _fn_name="${_fn_name%%\(\)}"
+          if [ -n "${_fn_name}" ]; then
+            builtin unset -f -- "${_fn_name}" 2>/dev/null || true
+          fi
+        done < <(command env | command awk -F= '/^BASH_FUNC_/ {sub(/=.*/, "", $0); print}')
 
-        # Defense-in-depth: scrub the credential-isolation.md §5.2 denylist
-        # from the step env before exec'ing the CLI. The CLI's
-        # buildAgentEnv() strips these for the agent's child processes, but
-        # also stripping at the action layer protects against caller
-        # workflow misconfiguration that leaves env vars in the step env
-        # (e.g. job-level env: GITHUB_TOKEN: ${{ github.token }}). Note that
-        # COFFREE_JOB_TOKEN / COFFREE_AI_PROXY_* / LLM_BASE_URL /
-        # LLM_API_KEY / COFFREE_SERVER_URL / COFFREE_JOB_ID are kept; the
-        # CLI needs them in its process env. CREDENTIAL_PROXY_URL /
-        # CREDENTIAL_PROXY_TOKEN are unset here and re-exported below from
-        # the staged values so they only ever come from the trusted source.
-        unset \
+        # =========================================================
+        # 2. Scrub the rest of the credential-isolation.md §5.2 denylist
+        #    from the step env. The CLI's buildAgentEnv() strips these
+        #    again when spawning agent subprocesses, but stripping at the
+        #    action layer first defends against caller workflow
+        #    misconfiguration that leaks tokens into the step env.
+        # =========================================================
+        # Keep COFFREE_JOB_TOKEN / COFFREE_AI_PROXY_* / LLM_BASE_URL /
+        # LLM_API_KEY / COFFREE_SERVER_URL / COFFREE_JOB_ID — the CLI needs
+        # them. CREDENTIAL_PROXY_URL / CREDENTIAL_PROXY_TOKEN are unset
+        # here and re-exported below from the staged values so they only
+        # ever come from the trusted source.
+        builtin unset \
           API_PROXY_TOKEN \
           CREDENTIAL_PROXY_URL CREDENTIAL_PROXY_TOKEN \
           COFFREE_ANTHROPIC_API_KEY COFFREE_OPENAI_API_KEY COFFREE_GEMINI_API_KEY \
@@ -578,19 +600,52 @@ runs:
           DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH DYLD_FRAMEWORK_PATH \
           NODE_OPTIONS
 
-        # Unset BASH_FUNC_* exported function definitions
-        # (DENIED_ENV_PREFIXES per credential-isolation.md §5.2 / §8).
-        while IFS= read -r _var; do
-          unset "${_var}"
-        done < <(env | awk -F= '/^BASH_FUNC_/ {sub(/=.*/, "", $0); print}')
+        : "${COFFREE_JOB_TOKEN:?COFFREE_JOB_TOKEN is not set; the OIDC exchange step did not run}"
 
-        # Inject the credential proxy contract for the CLI's resolver. These
-        # appear on the §5.2 denylist; the CLI's buildAgentEnv() strips
-        # them when spawning agent subprocesses, so the agent never sees
-        # them. The values come from the staging dir (written by Acquire
-        # from tokens.json), not from $GITHUB_ENV.
+        # =========================================================
+        # 3. Read the staged credential proxy state. Configure credential
+        #    shims left these on disk for this exact moment; we will
+        #    delete the staging dir below before exec'ing the CLI so the
+        #    agent (which inherits this shell's lifetime) cannot read it.
+        # =========================================================
+        stage_token_file="${COFFREE_SHIM_STAGING_DIR}/credential_proxy_token"
+        stage_url_file="${COFFREE_SHIM_STAGING_DIR}/api_proxy_url"
+        if [ ! -f "${stage_token_file}" ] || [ ! -f "${stage_url_file}" ]; then
+          echo "::error::Missing staged credential proxy state (Configure credential shims step did not run)."
+          exit 1
+        fi
+        credential_proxy_token=$(command cat "${stage_token_file}")
+        api_proxy_url=$(command cat "${stage_url_file}")
+
+        # Re-validate post-staging (defence in depth, identical to the
+        # checks in Acquire / Configure shims).
+        if ! command printf '%s' "${credential_proxy_token}" | command grep -qE '^[A-Za-z0-9_-]+$'; then
+          echo "::error::credential_proxy_token contains characters outside [A-Za-z0-9_-]"
+          exit 1
+        fi
+        if ! command printf '%s' "${api_proxy_url}" | command grep -qE '^https?://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._-]*)*$'; then
+          echo "::error::api_proxy_url has invalid format: ${api_proxy_url}"
+          exit 1
+        fi
+
+        # =========================================================
+        # 4. Inject the credential proxy contract for the CLI's resolver.
+        #    These env vars are on the §5.2 denylist for *agent* env; the
+        #    CLI's buildAgentEnv() strips them when spawning agent
+        #    subprocesses, so the agent never sees them. The CLI itself
+        #    needs them to construct the credential resolver
+        #    (credential-isolation.md §2.3 / §3.1).
+        # =========================================================
         export CREDENTIAL_PROXY_URL="${api_proxy_url}"
         export CREDENTIAL_PROXY_TOKEN="${credential_proxy_token}"
+
+        # =========================================================
+        # 5. Delete the staging dir BEFORE exec so the file does not live
+        #    on disk during the agent run. Cleanup credential shims still
+        #    runs `rm -rf` as a defensive backstop on `if: always()`.
+        # =========================================================
+        command rm -rf -- "${COFFREE_SHIM_STAGING_DIR}"
+        builtin unset COFFREE_SHIM_STAGING_DIR
 
         # COFFREE_AI_PROXY_TOKEN / _URL / _PROVIDERS are injected by the
         # Acquire proxy tokens step iff capabilities lists at least one
@@ -599,7 +654,7 @@ runs:
         # empty values disable the local-LLM route per the CLI's
         # provider-registry.
         echo "[run] starting coffree run-job"
-        exec coffree run-job
+        exec env "${_bash_func_unset_args[@]}" coffree run-job
 
     - name: Cleanup credential shims
       if: always()
@@ -612,27 +667,49 @@ runs:
         # Always-run cleanup per credential-isolation.md §4.4. Both branches
         # are tolerant of missing state because earlier steps may have
         # failed before producing it.
+        shim_dir=""
         if [ -f "${COFFREE_SHIM_DIR_FILE}" ]; then
           shim_dir=$(cat "${COFFREE_SHIM_DIR_FILE}")
-          if [ -n "${shim_dir}" ] && [ -d "${shim_dir}" ]; then
-            rm -rf "${shim_dir}"
-            echo "[cleanup] removed shim dir ${shim_dir}"
-          fi
-          rm -f "${COFFREE_SHIM_DIR_FILE}"
+          # Validate the recorded path matches an action-created shim dir
+          # (mktemp -d under $RUNNER_TEMP/coffree-shims-XXXXXX) before
+          # rm -rf'ing it, so a tampered file or stale state cannot trick
+          # us into removing an unrelated directory.
+          case "${shim_dir}" in
+            "${RUNNER_TEMP}/coffree-shims-"*)
+              if [ -d "${shim_dir}" ]; then
+                rm -rf -- "${shim_dir}"
+                echo "[cleanup] removed shim dir ${shim_dir}"
+              fi
+              ;;
+            *)
+              echo "[cleanup] refusing to remove unrecognised shim dir: ${shim_dir}"
+              shim_dir=""
+              ;;
+          esac
+          rm -f -- "${COFFREE_SHIM_DIR_FILE}"
         else
           echo "[cleanup] no shim dir to remove (Configure credential shims step did not run)"
         fi
 
-        # The staging dir is normally removed by Configure credential shims;
-        # tolerate its absence and remove it if an earlier step left it
-        # behind on failure.
+        # Run coffree normally removes the staging dir before exec; this
+        # is a defensive backstop for early-failure paths.
         if [ -d "${COFFREE_SHIM_STAGING_DIR}" ]; then
-          rm -rf "${COFFREE_SHIM_STAGING_DIR}"
+          rm -rf -- "${COFFREE_SHIM_STAGING_DIR}"
           echo "[cleanup] removed staging dir ${COFFREE_SHIM_STAGING_DIR}"
         fi
 
-        # Unset the global git credential helper. `--unset` returns non-zero
-        # if no entry exists; treat that as success because the helper might
-        # never have been set when an earlier step failed.
-        git config --global --unset credential.helper 2>/dev/null || true
-        echo "[cleanup] credential helper unset"
+        # Unset the global git credential helper only if it still points at
+        # the helper we installed (do not touch a pre-existing helper that
+        # the runner had configured for unrelated reasons).
+        if [ -n "${shim_dir}" ]; then
+          expected_helper="${shim_dir}/git-credential-coffree"
+          current_helper=$(git config --global credential.helper 2>/dev/null || true)
+          if [ "${current_helper}" = "${expected_helper}" ]; then
+            git config --global --unset credential.helper
+            echo "[cleanup] credential helper unset"
+          else
+            echo "[cleanup] credential helper not unset (current value differs from action-installed helper)"
+          fi
+        else
+          echo "[cleanup] credential helper not unset (no recorded shim dir)"
+        fi
