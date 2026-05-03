@@ -113,8 +113,11 @@ keys + the optional local-LLM credential need GitHub Secrets entries.
    to obtain a `job_token`. The exchange retries up to 3 times after
    the initial attempt on `500` / `503` (4 attempts total, 1s/2s/4s
    backoff) and exits immediately on `400` / `401` / `403` / `404` /
-   `411` / `413`. On success the `job_token` is masked and exported via
-   `$GITHUB_ENV`.
+   `411` / `413`. On success the `job_token` is masked and written to
+   `$GITHUB_OUTPUT` under the step id `oidc`; the Run coffree step
+   pulls it back in via `${{ steps.oidc.outputs.job_token }}` so the
+   token is scoped to this composite action and never reaches caller
+   workflow steps that run after it.
 5. **Configure credential shims**: install a `gh` shim and a
    `git-credential-coffree` helper into a `mktemp -d` directory under
    `$RUNNER_TEMP`, with the credential proxy URL + token embedded in

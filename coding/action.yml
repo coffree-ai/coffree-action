@@ -404,7 +404,8 @@ runs:
             # shell metachar) or absent, jq exits non-zero and trips
             # `set -e`; the explicit `||` handler turns it into a clear
             # error message. This blocks newline injection from a malformed
-            # 200 response into $GITHUB_ENV.
+            # 200 response into $GITHUB_OUTPUT (and any downstream
+            # consumer of that step output).
             job_token=$(jq -er '
               .job_token
               | select(type == "string" and test("^[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+$"))
@@ -455,10 +456,13 @@ runs:
       env:
         COFFREE_SHIM_STAGING_DIR: ${{ runner.temp }}/coffree-shim-staging
         COFFREE_SHIM_DIR_FILE: ${{ runner.temp }}/coffree-shim-dir
-        COFFREE_JOB_TOKEN: ${{ steps.oidc.outputs.job_token }}
       run: |
         set -euo pipefail
-        : "${COFFREE_JOB_TOKEN:?COFFREE_JOB_TOKEN is not set; the OIDC exchange step did not run}"
+        # No COFFREE_JOB_TOKEN guard here — composite steps fail-fast on
+        # previous step failure, so reaching this step implies the OIDC
+        # exchange succeeded. Keeping the token off this step's env limits
+        # the surface where the value is materialised
+        # (credential-isolation.md §5.2 leak-prevention).
 
         stage_token_file="${COFFREE_SHIM_STAGING_DIR}/credential_proxy_token"
         stage_url_file="${COFFREE_SHIM_STAGING_DIR}/api_proxy_url"
