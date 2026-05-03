@@ -1,21 +1,14 @@
-name: 'Coffree Coding Job (dummy runner)'
+name: 'Coffree coding runner'
 description: |
-  Minimal dummy runner that exercises the coffree job HTTP contract end-to-end
-  by calling render -> progress (1 event) -> heartbeat (1 beat) -> complete in
-  sequence with curl. No real agent is started and no MCP / credential / shim
-  setup is performed; this is the smallest composite action that drives a job
-  through the server-side lifecycle defined in
-  docs/specs/job-execution/job-execution.md and progress-reporting.md
-  (coffree-ai/coffree PR #67 implements the four endpoints).
+  Real coffree coding-job runner. Picks proxy tokens up from the
+  api-proxy service container, downloads the coffree CLI, installs gh /
+  gitleaks if needed, exchanges a GHA OIDC token for a job_token,
+  configures the gh / git credential shims, runs `coffree run-job`, and
+  cleans up the shim directory in a post step.
 
-  When `job_token` is not supplied the action acquires one by exchanging a GHA
-  OIDC token at `${server_url}/auth/exchange-token`
-  (docs/specs/job-execution/gha-runtime.md §4.4). Production callers should
-  leave `job_token` empty; only test / development paths pre-set it
-  (gha-runtime.md §4.3).
-
-  Production runtime (TypeScript binary, agent SDK adapters, credential proxy /
-  shims) lands in later P4.x slices.
+  Spec: docs/specs/job-execution/gha-runtime.md §3-§4 and
+  docs/specs/job-execution/credential-isolation.md §2-§5 in the
+  coffree-ai/coffree repository.
 
 inputs:
   job_id:
@@ -27,42 +20,240 @@ inputs:
       Example: https://coffree.example.com
       Used both as the exchange-token endpoint host and as the OIDC audience
       (server-side audience check requires exact match per
-      docs/specs/auth/overview.md runner 認証).
+      docs/specs/auth/overview.md runner authentication).
     required: true
-  job_token:
+  llm_base_url:
     description: |
-      Optional pre-issued job_token for testing / development. When omitted
-      (or empty) the action exchanges a GHA OIDC token at
-      `${server_url}/auth/exchange-token` (gha-runtime.md §4.4). When
-      supplied the OIDC exchange is skipped and the value is used as-is
-      (gha-runtime.md §4.3). Production callers should leave this empty and
-      add `permissions: id-token: write` to the workflow.
+      Optional URL for the local LLM / OpenAI-compatible endpoint
+      (provider = `ollama` / `openai-compatible`). Empty disables the
+      local route — SaaS-only deployments may omit this. See
+      docs/specs/job-execution/gha-runtime.md §3.1 / §4.6.
+    required: false
+    default: ''
+  llm_api_key:
+    description: |
+      Optional credential for the local LLM / OpenAI-compatible endpoint
+      (e.g. OpenRouter). Ollama / vLLM single-node deployments may leave
+      this blank. Passed alongside `llm_base_url`.
     required: false
     default: ''
 
 runs:
   using: 'composite'
   steps:
-    - name: Acquire job_token (test override or OIDC exchange)
+    - name: Acquire proxy tokens
+      shell: bash
+      env:
+        COFFREE_SHIM_STAGING_DIR: ${{ runner.temp }}/coffree-shim-staging
+      run: |
+        set -euo pipefail
+
+        TOKEN_FILE="${RUNNER_TEMP}/coffree-tokens/tokens.json"
+        CAPS_FILE="${RUNNER_TEMP}/coffree-tokens/capabilities.json"
+
+        if [ ! -f "${TOKEN_FILE}" ]; then
+          echo "::error::Missing ${TOKEN_FILE}; api-proxy service container did not write tokens.json. Check that ghcr.io/coffree-ai/api-proxy is healthy and that services.api-proxy.volumes mounts \${{ runner.temp }}/coffree-tokens:/tokens (gha-runtime.md §2.1 §3.5)."
+          exit 1
+        fi
+        if [ ! -f "${CAPS_FILE}" ]; then
+          echo "::error::Missing ${CAPS_FILE}; api-proxy did not write capabilities.json (gha-runtime.md §3.5)."
+          exit 1
+        fi
+
+        api_proxy_token=$(jq -r '.api_proxy_token // empty' "${TOKEN_FILE}")
+        credential_proxy_token=$(jq -r '.credential_proxy_token // empty' "${TOKEN_FILE}")
+        api_proxy_url=$(jq -r '.api_proxy_url // empty' "${CAPS_FILE}")
+        saas_providers=$(jq -r '.providers | join(",")' "${CAPS_FILE}")
+
+        if [ -z "${api_proxy_token}" ] || [ -z "${credential_proxy_token}" ] || [ -z "${api_proxy_url}" ]; then
+          echo "::error::Required token fields missing from tokens.json / capabilities.json (api_proxy_token / credential_proxy_token / api_proxy_url)."
+          exit 1
+        fi
+
+        # Validate shapes before propagating. credential_proxy_token will be
+        # interpolated into shim shell scripts (credential-isolation.md §4.2);
+        # restrict to alphanum / dash / underscore as a defence against shell
+        # metachars even though the value comes from the trusted api-proxy.
+        case "${credential_proxy_token}" in
+          *[!A-Za-z0-9_-]*)
+            echo "::error::credential_proxy_token contains characters outside [A-Za-z0-9_-]"
+            exit 1
+            ;;
+        esac
+        case "${api_proxy_url}" in
+          http://*|https://*) ;;
+          *)
+            echo "::error::api_proxy_url is not an http(s) URL: ${api_proxy_url}"
+            exit 1
+            ;;
+        esac
+
+        # Mask both tokens before any subsequent log line could expose them.
+        echo "::add-mask::${api_proxy_token}"
+        echo "::add-mask::${credential_proxy_token}"
+
+        # Stage credential_proxy_token + api_proxy_url for the Configure
+        # credential shims step. Keep them off $GITHUB_ENV so they are not
+        # inherited by the `coffree run-job` (= agent) process. Per
+        # credential-isolation.md §5.2 denylist:
+        # - CREDENTIAL_PROXY_TOKEN must not appear in agent env
+        # - CREDENTIAL_PROXY_URL must not appear in agent env
+        mkdir -p "${COFFREE_SHIM_STAGING_DIR}"
+        chmod 700 "${COFFREE_SHIM_STAGING_DIR}"
+        printf '%s' "${credential_proxy_token}" > "${COFFREE_SHIM_STAGING_DIR}/credential_proxy_token"
+        printf '%s' "${api_proxy_url}" > "${COFFREE_SHIM_STAGING_DIR}/api_proxy_url"
+        chmod 600 "${COFFREE_SHIM_STAGING_DIR}/credential_proxy_token" \
+                  "${COFFREE_SHIM_STAGING_DIR}/api_proxy_url"
+
+        # Delete tokens.json and capabilities.json from the shared volume so
+        # that the agent process (which runs in the same UID) cannot read
+        # them later (gha-runtime.md §3.4 §3.5).
+        rm -f "${TOKEN_FILE}" "${CAPS_FILE}"
+
+        # Inject COFFREE_AI_PROXY_* env iff capabilities lists at least one
+        # SaaS provider. Empty providers (= local-LLM-only deployment) means
+        # the API proxy is unused and CLI runtime should not pin to it.
+        if [ -n "${saas_providers}" ]; then
+          {
+            echo "COFFREE_AI_PROXY_TOKEN=${api_proxy_token}"
+            echo "COFFREE_AI_PROXY_URL=${api_proxy_url}"
+            echo "COFFREE_AI_PROXY_PROVIDERS=${saas_providers}"
+          } >> "${GITHUB_ENV}"
+          echo "[acquire] capabilities providers=${saas_providers}, COFFREE_AI_PROXY_* injected"
+        else
+          echo "[acquire] capabilities providers empty; COFFREE_AI_PROXY_* not injected (local-LLM-only deployment)"
+        fi
+
+    - name: Download coffree CLI
+      shell: bash
+      env:
+        COFFREE_SERVER_URL: ${{ inputs.server_url }}
+      run: |
+        set -euo pipefail
+
+        # Architecture detection per gha-runtime.md §4.1.
+        case "$(uname -m)" in
+          x86_64)  target="linux-x64" ;;
+          aarch64) target="linux-arm64" ;;
+          *)
+            echo "::error::Unsupported runner architecture: $(uname -m). coffree CLI publishes linux-x64 / linux-arm64 only."
+            exit 1
+            ;;
+        esac
+
+        bin_dir="${RUNNER_TEMP}/coffree-bin"
+        mkdir -p "${bin_dir}"
+        bin_path="${bin_dir}/coffree"
+        sum_path="${bin_dir}/coffree.sha256"
+        bin_url="${COFFREE_SERVER_URL}/orchestrator/cli/download/${target}"
+        sum_url="${bin_url}/sha256"
+
+        echo "[download] fetching binary from ${bin_url}"
+        if ! curl --fail-with-body -sSL -o "${bin_path}" "${bin_url}"; then
+          echo "::error::Failed to download coffree CLI from ${bin_url}."
+          rm -f "${bin_path}"
+          exit 1
+        fi
+        echo "[download] fetching sha256 from ${sum_url}"
+        if ! curl --fail-with-body -sSL -o "${sum_path}" "${sum_url}"; then
+          echo "::error::Failed to download coffree CLI sha256 from ${sum_url}."
+          rm -f "${bin_path}" "${sum_path}"
+          exit 1
+        fi
+
+        expected=$(awk '{print $1}' "${sum_path}")
+        if [ -z "${expected}" ]; then
+          echo "::error::sha256 endpoint returned an empty checksum."
+          rm -f "${bin_path}" "${sum_path}"
+          exit 1
+        fi
+        actual=$(sha256sum "${bin_path}" | awk '{print $1}')
+        if [ "${actual}" != "${expected}" ]; then
+          echo "::error::coffree CLI checksum mismatch: expected ${expected}, got ${actual}. Discarding binary."
+          rm -f "${bin_path}" "${sum_path}"
+          exit 1
+        fi
+
+        chmod +x "${bin_path}"
+        echo "${bin_dir}" >> "${GITHUB_PATH}"
+        echo "[download] coffree CLI installed at ${bin_path} (target=${target})"
+
+    - name: Install AI agent CLIs
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        local_bin="${HOME}/.local/bin"
+        path_added=0
+
+        # gh CLI per gha-runtime.md §4.2: GitHub-hosted runners ship gh
+        # pre-installed; on self-hosted runners install via the official
+        # tarball into ${HOME}/.local/bin (root/sudo not required).
+        if ! command -v gh >/dev/null 2>&1; then
+          gh_version="2.62.0"
+          case "$(uname -m)" in
+            x86_64)  gh_arch="amd64" ;;
+            aarch64) gh_arch="arm64" ;;
+            *)       gh_arch="amd64" ;;
+          esac
+          gh_tarball="gh_${gh_version}_linux_${gh_arch}.tar.gz"
+          gh_url="https://github.com/cli/cli/releases/download/v${gh_version}/${gh_tarball}"
+          mkdir -p "${local_bin}"
+          tmp=$(mktemp -d)
+          # shellcheck disable=SC2064
+          trap "rm -rf '${tmp}'" EXIT
+          echo "[install] fetching gh CLI v${gh_version} (${gh_arch})"
+          curl --fail-with-body -sSL -o "${tmp}/gh.tgz" "${gh_url}"
+          tar -xzf "${tmp}/gh.tgz" -C "${tmp}"
+          mv "${tmp}"/gh_*/bin/gh "${local_bin}/gh"
+          chmod +x "${local_bin}/gh"
+          path_added=1
+          echo "[install] gh CLI v${gh_version} installed at ${local_bin}/gh"
+          trap - EXIT
+          rm -rf "${tmp}"
+        else
+          echo "[install] gh CLI already installed at $(command -v gh)"
+        fi
+
+        # gitleaks per gha-runtime.md §4.2.
+        if ! command -v gitleaks >/dev/null 2>&1; then
+          gitleaks_version="8.21.2"
+          case "$(uname -m)" in
+            x86_64)  gitleaks_arch="x64" ;;
+            aarch64) gitleaks_arch="arm64" ;;
+            *)       gitleaks_arch="x64" ;;
+          esac
+          gitleaks_tarball="gitleaks_${gitleaks_version}_linux_${gitleaks_arch}.tar.gz"
+          gitleaks_url="https://github.com/gitleaks/gitleaks/releases/download/v${gitleaks_version}/${gitleaks_tarball}"
+          mkdir -p "${local_bin}"
+          tmp=$(mktemp -d)
+          # shellcheck disable=SC2064
+          trap "rm -rf '${tmp}'" EXIT
+          echo "[install] fetching gitleaks v${gitleaks_version} (${gitleaks_arch})"
+          curl --fail-with-body -sSL -o "${tmp}/gitleaks.tgz" "${gitleaks_url}"
+          tar -xzf "${tmp}/gitleaks.tgz" -C "${tmp}"
+          mv "${tmp}/gitleaks" "${local_bin}/gitleaks"
+          chmod +x "${local_bin}/gitleaks"
+          path_added=1
+          echo "[install] gitleaks v${gitleaks_version} installed at ${local_bin}/gitleaks"
+          trap - EXIT
+          rm -rf "${tmp}"
+        else
+          echo "[install] gitleaks already installed at $(command -v gitleaks)"
+        fi
+
+        if [ "${path_added}" = "1" ]; then
+          echo "${local_bin}" >> "${GITHUB_PATH}"
+        fi
+
+    - name: Exchange OIDC token
       shell: bash
       env:
         COFFREE_SERVER_URL: ${{ inputs.server_url }}
         COFFREE_JOB_ID: ${{ inputs.job_id }}
-        COFFREE_JOB_TOKEN_INPUT: ${{ inputs.job_token }}
       run: |
         set -euo pipefail
-
-        # Test fallback (gha-runtime.md §4.3): caller passes job_token
-        # directly. Mask and propagate via $GITHUB_ENV so subsequent steps
-        # in this composite action read it from the environment.
-        if [ -n "${COFFREE_JOB_TOKEN_INPUT}" ]; then
-          echo "[acquire] using job_token from inputs (test fallback per gha-runtime §4.3)"
-          echo "::add-mask::${COFFREE_JOB_TOKEN_INPUT}"
-          echo "COFFREE_JOB_TOKEN=${COFFREE_JOB_TOKEN_INPUT}" >> "${GITHUB_ENV}"
-          exit 0
-        fi
-
-        echo "[acquire] exchanging GHA OIDC token at ${COFFREE_SERVER_URL}/auth/exchange-token"
+        echo "[oidc] exchanging GHA OIDC token at ${COFFREE_SERVER_URL}/auth/exchange-token"
 
         # ACTIONS_ID_TOKEN_REQUEST_{URL,TOKEN} are populated by the runner
         # only when the workflow declares `permissions: id-token: write`
@@ -82,10 +273,10 @@ runs:
           exit 1
         fi
 
-        # The OIDC request URL already carries a query string, so append
+        # The OIDC request URL already carries `?api-version=...`, so append
         # `&audience=...`. Audience must equal the server's PUBLIC_URL
         # (scheme + host, no trailing slash) so the JWT `aud` claim matches
-        # exactly on the server (auth/overview.md runner 認証 step 5).
+        # exactly on the server (auth/overview.md runner authentication).
         oidc_response=$(curl --fail-with-body -sS \
           -H "Authorization: bearer ${oidc_request_token}" \
           "${oidc_url}&audience=${COFFREE_SERVER_URL}") || {
@@ -97,7 +288,6 @@ runs:
           echo "::error::OIDC token response did not contain a 'value' field."
           exit 1
         fi
-        # Mask the OIDC token before any subsequent log line could expose it.
         echo "::add-mask::${oidc_token}"
 
         # Build exchange-token request body via jq for safe JSON escaping.
@@ -152,7 +342,7 @@ runs:
                 cat "${response_file}" || true
                 exit 1
               fi
-              echo "[acquire] exchange-token returned ${http_status}, retrying in ${backoff}s (attempt ${attempt}/${max_attempts})"
+              echo "[oidc] exchange-token returned ${http_status}, retrying in ${backoff}s (attempt ${attempt}/${max_attempts})"
               cat "${response_file}" || true
               sleep "${backoff}"
               backoff=$((backoff * 2))
@@ -165,90 +355,199 @@ runs:
           esac
         done
 
-        # Mask the issued job_token before publishing it via $GITHUB_ENV.
-        # The runner does not log values written to GITHUB_ENV, but
-        # registering the mask now scrubs any later log line that happens
-        # to contain the token (e.g. an HTTP error body from a downstream
-        # endpoint).
         echo "::add-mask::${job_token}"
         echo "COFFREE_JOB_TOKEN=${job_token}" >> "${GITHUB_ENV}"
-        echo "[acquire] job_token obtained via OIDC exchange"
+        echo "[oidc] job_token obtained via OIDC exchange"
 
-    - name: Render job
+    - name: Configure credential shims
+      shell: bash
+      env:
+        COFFREE_SHIM_STAGING_DIR: ${{ runner.temp }}/coffree-shim-staging
+        COFFREE_SHIM_DIR_FILE: ${{ runner.temp }}/coffree-shim-dir
+      run: |
+        set -euo pipefail
+        : "${COFFREE_JOB_TOKEN:?COFFREE_JOB_TOKEN is not set; the OIDC exchange step did not run}"
+
+        stage_token_file="${COFFREE_SHIM_STAGING_DIR}/credential_proxy_token"
+        stage_url_file="${COFFREE_SHIM_STAGING_DIR}/api_proxy_url"
+        if [ ! -f "${stage_token_file}" ] || [ ! -f "${stage_url_file}" ]; then
+          echo "::error::Missing staged credential proxy token / URL from Acquire step."
+          exit 1
+        fi
+        credential_proxy_token=$(cat "${stage_token_file}")
+        api_proxy_url=$(cat "${stage_url_file}")
+
+        # Re-validate post-staging (defence in depth).
+        case "${credential_proxy_token}" in
+          *[!A-Za-z0-9_-]*)
+            echo "::error::credential_proxy_token contains characters outside [A-Za-z0-9_-]"
+            exit 1
+            ;;
+        esac
+        case "${api_proxy_url}" in
+          http://*|https://*) ;;
+          *)
+            echo "::error::api_proxy_url is not an http(s) URL: ${api_proxy_url}"
+            exit 1
+            ;;
+        esac
+
+        # Resolve the real gh binary BEFORE prepending the shim directory to
+        # PATH. The Install AI agent CLIs step guarantees gh is installed.
+        if ! command -v gh >/dev/null 2>&1; then
+          echo "::error::gh CLI not found on PATH; the Install AI agent CLIs step should have installed it."
+          exit 1
+        fi
+        gh_real_path=$(command -v gh)
+
+        shim_dir=$(mktemp -d "${RUNNER_TEMP}/coffree-shims-XXXXXX")
+        chmod 700 "${shim_dir}"
+
+        # gh shim per credential-isolation.md §4.2 with the gha-runtime.md
+        # §4.5 subcommand allowlist (pr / repo / api / issue). The script
+        # parses argv to find the first non-flag token, skipping known
+        # value-bearing global flags (--repo / --hostname / -R / -H).
+        cat > "${shim_dir}/gh" <<'SHIM_EOF'
+        #!/bin/sh
+        # coffree gh wrapper — fetches token from credential proxy then
+        # execs the real gh. credential-isolation.md §4.2 / gha-runtime.md
+        # §4.5 (subcommand allowlist).
+        sub=""
+        skip_next=0
+        for arg in "$@"; do
+          if [ "${skip_next}" = "1" ]; then
+            skip_next=0
+            continue
+          fi
+          case "${arg}" in
+            --repo|--hostname|-R|-H)
+              skip_next=1
+              ;;
+            -*)
+              ;;
+            *)
+              sub="${arg}"
+              break
+              ;;
+          esac
+        done
+        case "${sub}" in
+          pr|repo|api|issue) ;;
+          *)
+            printf 'coffree: gh subcommand "%s" is not in the allowlist (pr, repo, api, issue)\n' "${sub}" >&2
+            exit 1
+            ;;
+        esac
+        _T=$(curl -sf -H "X-Proxy-Token: __CRED_TOKEN__" "__PROXY_URL__/github-token" | jq -r .token 2>/dev/null)
+        if [ -n "${_T}" ]; then
+          export GH_TOKEN="${_T}"
+        else
+          echo "coffree: warning: failed to fetch GitHub token from credential proxy" >&2
+        fi
+        unset _T
+        exec "__GH_REAL__" "$@"
+        SHIM_EOF
+
+        # Substitute placeholders. Validated character classes guarantee no
+        # sed metachars sneak in (alphanum / dash / underscore for the token,
+        # http(s) URL for the proxy URL, real-path for the gh binary).
+        sed -i \
+          -e "s|__CRED_TOKEN__|${credential_proxy_token}|g" \
+          -e "s|__PROXY_URL__|${api_proxy_url}|g" \
+          -e "s|__GH_REAL__|${gh_real_path}|g" \
+          "${shim_dir}/gh"
+        chmod 555 "${shim_dir}/gh"
+
+        # git credential helper per credential-isolation.md §4.3.
+        cat > "${shim_dir}/git-credential-coffree" <<'HELPER_EOF'
+        #!/bin/sh
+        # coffree git credential helper — fetches token from credential
+        # proxy. credential-isolation.md §4.3.
+        case "$1" in
+          get)
+            T=$(curl -sf -H "X-Proxy-Token: __CRED_TOKEN__" "__PROXY_URL__/github-token" | jq -r .token 2>/dev/null)
+            [ -n "${T}" ] && printf 'protocol=https\nhost=github.com\nusername=x-access-token\npassword=%s\n' "${T}"
+            ;;
+        esac
+        HELPER_EOF
+
+        sed -i \
+          -e "s|__CRED_TOKEN__|${credential_proxy_token}|g" \
+          -e "s|__PROXY_URL__|${api_proxy_url}|g" \
+          "${shim_dir}/git-credential-coffree"
+        chmod 555 "${shim_dir}/git-credential-coffree"
+
+        # Configure git to use the helper at global scope. This overrides
+        # any helper actions/checkout might have set on the repo
+        # (gha-runtime.md §4.5).
+        git config --global credential.helper "${shim_dir}/git-credential-coffree"
+
+        # Prepend shim dir to PATH so `gh` resolves to the shim before the
+        # real binary in subsequent steps.
+        echo "${shim_dir}" >> "${GITHUB_PATH}"
+
+        # Record SHIM_DIR for the cleanup step. Stays off agent env per
+        # credential-isolation.md §5.2 denylist (COFFREE_SHIM_DIR is denied).
+        printf '%s' "${shim_dir}" > "${COFFREE_SHIM_DIR_FILE}"
+        chmod 600 "${COFFREE_SHIM_DIR_FILE}"
+
+        # Wipe staged credential proxy token + URL from disk; the values
+        # are now embedded in the shim scripts and no longer needed.
+        rm -rf "${COFFREE_SHIM_STAGING_DIR}"
+
+        echo "[shims] gh shim + git credential helper installed at ${shim_dir}"
+
+    - name: Run coffree
       shell: bash
       env:
         COFFREE_SERVER_URL: ${{ inputs.server_url }}
         COFFREE_JOB_ID: ${{ inputs.job_id }}
+        LLM_BASE_URL: ${{ inputs.llm_base_url }}
+        LLM_API_KEY: ${{ inputs.llm_api_key }}
       run: |
         set -euo pipefail
-        : "${COFFREE_JOB_TOKEN:?COFFREE_JOB_TOKEN is not set; the Acquire step did not run}"
-        echo "[render] POST ${COFFREE_SERVER_URL}/jobs/${COFFREE_JOB_ID}/render"
-        # --data-binary '' sends an explicit zero-byte body so curl emits a
-        # POST with Content-Length: 0; the route does not parse the body.
-        curl --fail-with-body -sS -X POST \
-          -H "Authorization: Bearer ${COFFREE_JOB_TOKEN}" \
-          -H "Content-Type: application/json" \
-          --data-binary '' \
-          "${COFFREE_SERVER_URL}/jobs/${COFFREE_JOB_ID}/render"
-        echo
+        : "${COFFREE_JOB_TOKEN:?COFFREE_JOB_TOKEN is not set; the OIDC exchange step did not run}"
+        # COFFREE_AI_PROXY_TOKEN / COFFREE_AI_PROXY_URL / COFFREE_AI_PROXY_PROVIDERS
+        # are injected by the Acquire proxy tokens step iff capabilities lists
+        # at least one SaaS provider; absence is normal for local-LLM-only
+        # deployments. LLM_BASE_URL / LLM_API_KEY pass through from action
+        # inputs; empty values disable the local-LLM route per the CLI's
+        # provider-registry.
+        echo "[run] starting coffree run-job"
+        exec coffree run-job
 
-    - name: Send progress event
+    - name: Cleanup credential shims
+      if: always()
       shell: bash
       env:
-        COFFREE_SERVER_URL: ${{ inputs.server_url }}
-        COFFREE_JOB_ID: ${{ inputs.job_id }}
+        COFFREE_SHIM_DIR_FILE: ${{ runner.temp }}/coffree-shim-dir
+        COFFREE_SHIM_STAGING_DIR: ${{ runner.temp }}/coffree-shim-staging
       run: |
         set -euo pipefail
-        : "${COFFREE_JOB_TOKEN:?COFFREE_JOB_TOKEN is not set; the Acquire step did not run}"
-        # Single assistant_message event. payload is a JSON string per the
-        # progress API contract (events[].payload is the wire shape).
-        body='{"events":[{"type":"assistant_message","payload":"{\"text\":\"dummy runner: hello\"}"}]}'
-        echo "[progress] POST ${COFFREE_SERVER_URL}/jobs/${COFFREE_JOB_ID}/progress"
-        # --data-binary preserves the body byte-for-byte and lets curl set
-        # Content-Length, which the server requires (411 length_required if
-        # absent / chunked).
-        curl --fail-with-body -sS -X POST \
-          -H "Authorization: Bearer ${COFFREE_JOB_TOKEN}" \
-          -H "Content-Type: application/json" \
-          --data-binary "${body}" \
-          "${COFFREE_SERVER_URL}/jobs/${COFFREE_JOB_ID}/progress"
-        echo
+        # Always-run cleanup per credential-isolation.md §4.4. Both branches
+        # are tolerant of missing state because earlier steps may have
+        # failed before producing it.
+        if [ -f "${COFFREE_SHIM_DIR_FILE}" ]; then
+          shim_dir=$(cat "${COFFREE_SHIM_DIR_FILE}")
+          if [ -n "${shim_dir}" ] && [ -d "${shim_dir}" ]; then
+            rm -rf "${shim_dir}"
+            echo "[cleanup] removed shim dir ${shim_dir}"
+          fi
+          rm -f "${COFFREE_SHIM_DIR_FILE}"
+        else
+          echo "[cleanup] no shim dir to remove (Configure credential shims step did not run)"
+        fi
 
-    - name: Send heartbeat
-      shell: bash
-      env:
-        COFFREE_SERVER_URL: ${{ inputs.server_url }}
-        COFFREE_JOB_ID: ${{ inputs.job_id }}
-      run: |
-        set -euo pipefail
-        : "${COFFREE_JOB_TOKEN:?COFFREE_JOB_TOKEN is not set; the Acquire step did not run}"
-        body='{"current_step":"dummy"}'
-        echo "[heartbeat] PATCH ${COFFREE_SERVER_URL}/jobs/${COFFREE_JOB_ID}/heartbeat"
-        curl --fail-with-body -sS -X PATCH \
-          -H "Authorization: Bearer ${COFFREE_JOB_TOKEN}" \
-          -H "Content-Type: application/json" \
-          --data-binary "${body}" \
-          "${COFFREE_SERVER_URL}/jobs/${COFFREE_JOB_ID}/heartbeat"
-        echo
+        # The staging dir is normally removed by Configure credential shims;
+        # tolerate its absence and remove it if an earlier step left it
+        # behind on failure.
+        if [ -d "${COFFREE_SHIM_STAGING_DIR}" ]; then
+          rm -rf "${COFFREE_SHIM_STAGING_DIR}"
+          echo "[cleanup] removed staging dir ${COFFREE_SHIM_STAGING_DIR}"
+        fi
 
-    - name: Complete job (success)
-      shell: bash
-      env:
-        COFFREE_SERVER_URL: ${{ inputs.server_url }}
-        COFFREE_JOB_ID: ${{ inputs.job_id }}
-      run: |
-        set -euo pipefail
-        : "${COFFREE_JOB_TOKEN:?COFFREE_JOB_TOKEN is not set; the Acquire step did not run}"
-        # decline_next_job=true keeps the new row (if routing produces one)
-        # in 'pending' so the regular dispatch path picks it up. Production
-        # complete route also forces decline when no mintJobToken is wired,
-        # so this matches today's server-side behaviour.
-        request_id=$(cat /proc/sys/kernel/random/uuid)
-        body=$(printf '{"request_id":"%s","success":true,"outcome":"completed","steps_completed":1,"steps_total":1,"decline_next_job":true}' "${request_id}")
-        echo "[complete] PATCH ${COFFREE_SERVER_URL}/jobs/${COFFREE_JOB_ID}/complete"
-        curl --fail-with-body -sS -X PATCH \
-          -H "Authorization: Bearer ${COFFREE_JOB_TOKEN}" \
-          -H "Content-Type: application/json" \
-          --data-binary "${body}" \
-          "${COFFREE_SERVER_URL}/jobs/${COFFREE_JOB_ID}/complete"
-        echo
+        # Unset the global git credential helper. `--unset` returns non-zero
+        # if no entry exists; treat that as success because the helper might
+        # never have been set when an earlier step failed.
+        git config --global --unset credential.helper 2>/dev/null || true
+        echo "[cleanup] credential helper unset"
