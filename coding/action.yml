@@ -174,6 +174,31 @@ runs:
       run: |
         set -euo pipefail
 
+        bin_dir="${RUNNER_TEMP}/coffree-bin"
+        mkdir -p "${bin_dir}"
+        bin_path="${bin_dir}/coffree"
+
+        # Development / test override per gha-runtime.md §4.1: if
+        # COFFREE_CLI_PATH is set in the job env, copy the local binary
+        # instead of downloading. Useful for self-host integration tests
+        # against a pre-built CLI without round-tripping through the server
+        # download endpoint.
+        if [ -n "${COFFREE_CLI_PATH:-}" ]; then
+          if [ ! -f "${COFFREE_CLI_PATH}" ]; then
+            echo "::error::COFFREE_CLI_PATH points to a missing file: ${COFFREE_CLI_PATH}"
+            exit 1
+          fi
+          if [ ! -x "${COFFREE_CLI_PATH}" ]; then
+            echo "::error::COFFREE_CLI_PATH is not executable: ${COFFREE_CLI_PATH}"
+            exit 1
+          fi
+          cp -- "${COFFREE_CLI_PATH}" "${bin_path}"
+          chmod +x "${bin_path}"
+          echo "${bin_dir}" >> "${GITHUB_PATH}"
+          echo "[download] using local coffree CLI from COFFREE_CLI_PATH=${COFFREE_CLI_PATH}"
+          exit 0
+        fi
+
         # Validate server_url shape. spec auth/overview.md and
         # gha-runtime.md §4.4 both require "scheme + host with no trailing
         # slash" so the OIDC `audience` claim and the download URL stay
@@ -195,9 +220,6 @@ runs:
             ;;
         esac
 
-        bin_dir="${RUNNER_TEMP}/coffree-bin"
-        mkdir -p "${bin_dir}"
-        bin_path="${bin_dir}/coffree"
         sum_path="${bin_dir}/coffree.sha256"
         bin_url="${COFFREE_SERVER_URL}/orchestrator/cli/download/${target}"
         sum_url="${bin_url}/sha256"
@@ -748,17 +770,18 @@ runs:
           echo "[cleanup] removed staging dir ${COFFREE_SHIM_STAGING_DIR}"
         fi
 
-        # Unset the global git credential helper only if it still points at
-        # the helper we installed (do not touch a pre-existing helper that
-        # the runner had configured for unrelated reasons).
+        # Unset the global git credential helper. Use --unset --fixed-value
+        # so the literal action-installed helper string is matched and
+        # removed even if other credential.helper entries exist (multivar)
+        # or were added during the run. Returns non-zero when no match;
+        # `|| true` swallows the case where the helper is already absent
+        # (e.g. an earlier step removed it).
         if [ -n "${shim_dir}" ]; then
           expected_helper="${shim_dir}/git-credential-coffree"
-          current_helper=$(git config --global credential.helper 2>/dev/null || true)
-          if [ "${current_helper}" = "${expected_helper}" ]; then
-            git config --global --unset credential.helper
+          if git config --global --unset --fixed-value credential.helper "${expected_helper}" 2>/dev/null; then
             echo "[cleanup] credential helper unset"
           else
-            echo "[cleanup] credential helper not unset (current value differs from action-installed helper)"
+            echo "[cleanup] credential helper already absent or different value"
           fi
         else
           echo "[cleanup] credential helper not unset (no recorded shim dir)"
