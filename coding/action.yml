@@ -72,21 +72,40 @@ runs:
 
         # Validate shapes before propagating. credential_proxy_token will be
         # interpolated into shim shell scripts (credential-isolation.md §4.2);
-        # restrict to alphanum / dash / underscore as a defence against shell
-        # metachars even though the value comes from the trusted api-proxy.
-        case "${credential_proxy_token}" in
-          *[!A-Za-z0-9_-]*)
-            echo "::error::credential_proxy_token contains characters outside [A-Za-z0-9_-]"
-            exit 1
-            ;;
-        esac
-        case "${api_proxy_url}" in
-          http://*|https://*) ;;
-          *)
-            echo "::error::api_proxy_url is not an http(s) URL: ${api_proxy_url}"
-            exit 1
-            ;;
-        esac
+        # api_proxy_url will be interpolated via sed -e "s|...|${url}|g".
+        # api_proxy_token / saas_providers are written to $GITHUB_ENV.
+        # Restrict each to a tight character class so newline / sed metachar
+        # / shell metachar injection is impossible even if api-proxy ever
+        # writes a malformed JSON value.
+        if ! printf '%s' "${credential_proxy_token}" | grep -qE '^[A-Za-z0-9_-]+$'; then
+          echo "::error::credential_proxy_token contains characters outside [A-Za-z0-9_-]"
+          exit 1
+        fi
+        if ! printf '%s' "${api_proxy_token}" | grep -qE '^[A-Za-z0-9_-]+$'; then
+          echo "::error::api_proxy_token contains characters outside [A-Za-z0-9_-]"
+          exit 1
+        fi
+        # api_proxy_url: http(s) scheme + host (alphanum + . + -) + optional
+        # :port + optional /path. Excludes sed metachars (| & \ newline) and
+        # shell metachars (" ' $ ` ; etc).
+        if ! printf '%s' "${api_proxy_url}" | grep -qE '^https?://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._-]*)*$'; then
+          echo "::error::api_proxy_url has invalid format: ${api_proxy_url}"
+          exit 1
+        fi
+        # saas_providers: comma-separated list of allowlisted provider names
+        # (credential-isolation.md §2.4).
+        if [ -n "${saas_providers}" ]; then
+          IFS=',' read -ra _provs <<<"${saas_providers}"
+          for p in "${_provs[@]}"; do
+            case "${p}" in
+              anthropic|openai|google) ;;
+              *)
+                echo "::error::Unknown provider in capabilities.providers: ${p}"
+                exit 1
+                ;;
+            esac
+          done
+        fi
 
         # Mask both tokens before any subsequent log line could expose them.
         echo "::add-mask::${api_proxy_token}"
@@ -377,20 +396,18 @@ runs:
         credential_proxy_token=$(cat "${stage_token_file}")
         api_proxy_url=$(cat "${stage_url_file}")
 
-        # Re-validate post-staging (defence in depth).
-        case "${credential_proxy_token}" in
-          *[!A-Za-z0-9_-]*)
-            echo "::error::credential_proxy_token contains characters outside [A-Za-z0-9_-]"
-            exit 1
-            ;;
-        esac
-        case "${api_proxy_url}" in
-          http://*|https://*) ;;
-          *)
-            echo "::error::api_proxy_url is not an http(s) URL: ${api_proxy_url}"
-            exit 1
-            ;;
-        esac
+        # Re-validate post-staging (defence in depth) with the same strict
+        # character classes used in the Acquire step. credential_proxy_token
+        # and api_proxy_url are interpolated into shim scripts via sed; they
+        # must not contain sed metachars (| & \ newline) or shell metachars.
+        if ! printf '%s' "${credential_proxy_token}" | grep -qE '^[A-Za-z0-9_-]+$'; then
+          echo "::error::credential_proxy_token contains characters outside [A-Za-z0-9_-]"
+          exit 1
+        fi
+        if ! printf '%s' "${api_proxy_url}" | grep -qE '^https?://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._-]*)*$'; then
+          echo "::error::api_proxy_url has invalid format: ${api_proxy_url}"
+          exit 1
+        fi
 
         # Resolve the real gh binary BEFORE prepending the shim directory to
         # PATH. The Install AI agent CLIs step guarantees gh is installed.
@@ -399,6 +416,12 @@ runs:
           exit 1
         fi
         gh_real_path=$(command -v gh)
+        # gh_real_path will be interpolated into the shim script via sed;
+        # require an absolute path with safe characters only.
+        if ! printf '%s' "${gh_real_path}" | grep -qE '^/[A-Za-z0-9._/-]+$'; then
+          echo "::error::gh real path is not a safe absolute path: ${gh_real_path}"
+          exit 1
+        fi
 
         shim_dir=$(mktemp -d "${RUNNER_TEMP}/coffree-shims-XXXXXX")
         chmod 700 "${shim_dir}"
@@ -491,9 +514,13 @@ runs:
         printf '%s' "${shim_dir}" > "${COFFREE_SHIM_DIR_FILE}"
         chmod 600 "${COFFREE_SHIM_DIR_FILE}"
 
-        # Wipe staged credential proxy token + URL from disk; the values
-        # are now embedded in the shim scripts and no longer needed.
-        rm -rf "${COFFREE_SHIM_STAGING_DIR}"
+        # NB: COFFREE_SHIM_STAGING_DIR is intentionally left in place. The
+        # Run coffree step reads credential_proxy_token + api_proxy_url back
+        # from it and exposes them via inline `export` to the CLI process
+        # only (CLI's credential-resolver.ts requires CREDENTIAL_PROXY_URL /
+        # CREDENTIAL_PROXY_TOKEN in process env per credential-isolation.md
+        # §2.3 / §3.1). The Cleanup credential shims post step removes the
+        # staging dir on `if: always()`.
 
         echo "[shims] gh shim + git credential helper installed at ${shim_dir}"
 
@@ -504,14 +531,72 @@ runs:
         COFFREE_JOB_ID: ${{ inputs.job_id }}
         LLM_BASE_URL: ${{ inputs.llm_base_url }}
         LLM_API_KEY: ${{ inputs.llm_api_key }}
+        COFFREE_SHIM_STAGING_DIR: ${{ runner.temp }}/coffree-shim-staging
       run: |
         set -euo pipefail
         : "${COFFREE_JOB_TOKEN:?COFFREE_JOB_TOKEN is not set; the OIDC exchange step did not run}"
-        # COFFREE_AI_PROXY_TOKEN / COFFREE_AI_PROXY_URL / COFFREE_AI_PROXY_PROVIDERS
-        # are injected by the Acquire proxy tokens step iff capabilities lists
-        # at least one SaaS provider; absence is normal for local-LLM-only
-        # deployments. LLM_BASE_URL / LLM_API_KEY pass through from action
-        # inputs; empty values disable the local-LLM route per the CLI's
+
+        # Read staged credential_proxy_token + api_proxy_url left behind by
+        # Configure credential shims. These are required to build the CLI's
+        # credential resolver (src/cli/run-job/credential-resolver.ts in
+        # coffree-ai/coffree, contract pinned by credential-isolation.md
+        # §2.3 / §3.1).
+        stage_token_file="${COFFREE_SHIM_STAGING_DIR}/credential_proxy_token"
+        stage_url_file="${COFFREE_SHIM_STAGING_DIR}/api_proxy_url"
+        if [ ! -f "${stage_token_file}" ] || [ ! -f "${stage_url_file}" ]; then
+          echo "::error::Missing staged credential proxy state (Configure credential shims step did not run)."
+          exit 1
+        fi
+        credential_proxy_token=$(cat "${stage_token_file}")
+        api_proxy_url=$(cat "${stage_url_file}")
+
+        # Defense-in-depth: scrub the credential-isolation.md §5.2 denylist
+        # from the step env before exec'ing the CLI. The CLI's
+        # buildAgentEnv() strips these for the agent's child processes, but
+        # also stripping at the action layer protects against caller
+        # workflow misconfiguration that leaves env vars in the step env
+        # (e.g. job-level env: GITHUB_TOKEN: ${{ github.token }}). Note that
+        # COFFREE_JOB_TOKEN / COFFREE_AI_PROXY_* / LLM_BASE_URL /
+        # LLM_API_KEY / COFFREE_SERVER_URL / COFFREE_JOB_ID are kept; the
+        # CLI needs them in its process env. CREDENTIAL_PROXY_URL /
+        # CREDENTIAL_PROXY_TOKEN are unset here and re-exported below from
+        # the staged values so they only ever come from the trusted source.
+        unset \
+          API_PROXY_TOKEN \
+          CREDENTIAL_PROXY_URL CREDENTIAL_PROXY_TOKEN \
+          COFFREE_ANTHROPIC_API_KEY COFFREE_OPENAI_API_KEY COFFREE_GEMINI_API_KEY \
+          ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN \
+          OPENAI_API_KEY \
+          GEMINI_API_KEY GOOGLE_GENERATIVE_AI_API_KEY \
+          GITHUB_TOKEN GH_TOKEN \
+          ACCESS_TOKEN REFRESH_TOKEN \
+          ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_ID_TOKEN_REQUEST_TOKEN \
+          ACTIONS_RUNTIME_TOKEN ACTIONS_CACHE_URL \
+          CLAUDECODE COFFREE_SHIM_DIR \
+          BASH_ENV ENV \
+          LD_PRELOAD LD_LIBRARY_PATH \
+          DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH DYLD_FRAMEWORK_PATH \
+          NODE_OPTIONS
+
+        # Unset BASH_FUNC_* exported function definitions
+        # (DENIED_ENV_PREFIXES per credential-isolation.md §5.2 / §8).
+        while IFS= read -r _var; do
+          unset "${_var}"
+        done < <(env | awk -F= '/^BASH_FUNC_/ {sub(/=.*/, "", $0); print}')
+
+        # Inject the credential proxy contract for the CLI's resolver. These
+        # appear on the §5.2 denylist; the CLI's buildAgentEnv() strips
+        # them when spawning agent subprocesses, so the agent never sees
+        # them. The values come from the staging dir (written by Acquire
+        # from tokens.json), not from $GITHUB_ENV.
+        export CREDENTIAL_PROXY_URL="${api_proxy_url}"
+        export CREDENTIAL_PROXY_TOKEN="${credential_proxy_token}"
+
+        # COFFREE_AI_PROXY_TOKEN / _URL / _PROVIDERS are injected by the
+        # Acquire proxy tokens step iff capabilities lists at least one
+        # SaaS provider; absence is normal for local-LLM-only deployments.
+        # LLM_BASE_URL / LLM_API_KEY pass through from action inputs;
+        # empty values disable the local-LLM route per the CLI's
         # provider-registry.
         echo "[run] starting coffree run-job"
         exec coffree run-job
