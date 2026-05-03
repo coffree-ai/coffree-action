@@ -174,6 +174,17 @@ runs:
       run: |
         set -euo pipefail
 
+        # Validate server_url shape FIRST so the validation also covers the
+        # OIDC exchange + Run coffree paths even when COFFREE_CLI_PATH
+        # short-circuits the download below. spec auth/overview.md and
+        # gha-runtime.md §4.4 both require "scheme + host with no trailing
+        # slash" so the OIDC `audience` claim stays intact.
+        server_url_re='^https?://[A-Za-z0-9.-]+(:[0-9]+)?$'
+        if [[ ! ${COFFREE_SERVER_URL} =~ ${server_url_re} ]]; then
+          echo "::error::server_url must be scheme+host with no path / no trailing slash (e.g. https://coffree.example.com): ${COFFREE_SERVER_URL}"
+          exit 1
+        fi
+
         bin_dir="${RUNNER_TEMP}/coffree-bin"
         mkdir -p "${bin_dir}"
         bin_path="${bin_dir}/coffree"
@@ -197,17 +208,6 @@ runs:
           echo "${bin_dir}" >> "${GITHUB_PATH}"
           echo "[download] using local coffree CLI from COFFREE_CLI_PATH=${COFFREE_CLI_PATH}"
           exit 0
-        fi
-
-        # Validate server_url shape. spec auth/overview.md and
-        # gha-runtime.md §4.4 both require "scheme + host with no trailing
-        # slash" so the OIDC `audience` claim and the download URL stay
-        # intact. This is the first step that uses server_url so we
-        # fail-fast here and skip re-validation in subsequent steps.
-        server_url_re='^https?://[A-Za-z0-9.-]+(:[0-9]+)?$'
-        if [[ ! ${COFFREE_SERVER_URL} =~ ${server_url_re} ]]; then
-          echo "::error::server_url must be scheme+host with no path / no trailing slash (e.g. https://coffree.example.com): ${COFFREE_SERVER_URL}"
-          exit 1
         fi
 
         # Architecture detection per gha-runtime.md §4.1.
@@ -323,6 +323,7 @@ runs:
         fi
 
     - name: Exchange OIDC token
+      id: oidc
       shell: bash
       env:
         COFFREE_SERVER_URL: ${{ inputs.server_url }}
@@ -440,7 +441,13 @@ runs:
         done
 
         echo "::add-mask::${job_token}"
-        echo "COFFREE_JOB_TOKEN=${job_token}" >> "${GITHUB_ENV}"
+        # Write to $GITHUB_OUTPUT (composite-step scoped) instead of
+        # $GITHUB_ENV (job scoped) so the token is only visible to other
+        # steps in this composite action — not to caller workflow steps
+        # that run after `coffree-ai/coffree-action/coding`.
+        # credential-isolation.md §5.2 lists COFFREE_JOB_TOKEN as a denied
+        # env key so we must keep it off broad job env.
+        echo "job_token=${job_token}" >> "${GITHUB_OUTPUT}"
         echo "[oidc] job_token obtained via OIDC exchange"
 
     - name: Configure credential shims
@@ -448,6 +455,7 @@ runs:
       env:
         COFFREE_SHIM_STAGING_DIR: ${{ runner.temp }}/coffree-shim-staging
         COFFREE_SHIM_DIR_FILE: ${{ runner.temp }}/coffree-shim-dir
+        COFFREE_JOB_TOKEN: ${{ steps.oidc.outputs.job_token }}
       run: |
         set -euo pipefail
         : "${COFFREE_JOB_TOKEN:?COFFREE_JOB_TOKEN is not set; the OIDC exchange step did not run}"
@@ -579,10 +587,12 @@ runs:
           "${shim_dir}/git-credential-coffree"
         chmod 555 "${shim_dir}/git-credential-coffree"
 
-        # Configure git to use the helper at global scope. This overrides
-        # any helper actions/checkout might have set on the repo
-        # (gha-runtime.md §4.5).
-        git config --global credential.helper "${shim_dir}/git-credential-coffree"
+        # Configure git to use the helper at global scope. --replace-all
+        # so any pre-existing values are replaced atomically (a multivar
+        # config without --replace-all aborts when more than one value
+        # is set). This overrides any helper actions/checkout might have
+        # set on the repo (gha-runtime.md §4.5).
+        git config --global --replace-all credential.helper "${shim_dir}/git-credential-coffree"
 
         # Prepend shim dir to PATH so `gh` resolves to the shim before the
         # real binary in subsequent steps.
@@ -607,6 +617,7 @@ runs:
         LLM_BASE_URL: ${{ inputs.llm_base_url }}
         LLM_API_KEY: ${{ inputs.llm_api_key }}
         COFFREE_SHIM_STAGING_DIR: ${{ runner.temp }}/coffree-shim-staging
+        COFFREE_JOB_TOKEN: ${{ steps.oidc.outputs.job_token }}
       run: |
         set -euo pipefail
 
