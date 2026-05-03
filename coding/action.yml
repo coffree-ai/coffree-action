@@ -66,9 +66,19 @@ runs:
           exit 1
         fi
 
-        api_proxy_token=$(jq -r '.api_proxy_token // empty' "${TOKEN_FILE}")
-        credential_proxy_token=$(jq -r '.credential_proxy_token // empty' "${TOKEN_FILE}")
-        api_proxy_url=$(jq -r '.api_proxy_url // empty' "${CAPS_FILE}")
+        # Slurp both JSON files into bash variables in one read each, then
+        # delete the files immediately. spec gha-runtime.md §3.5 wants
+        # "read then immediate delete" so the agent (which runs in the same
+        # UID and can read $RUNNER_TEMP) cannot reach the files. The trap
+        # remains as a backstop in case the rm fails.
+        tokens_json=$(cat "${TOKEN_FILE}")
+        caps_json=$(cat "${CAPS_FILE}")
+        rm -f -- "${TOKEN_FILE}" "${CAPS_FILE}"
+
+        # Subsequent jq invocations read from the in-memory strings.
+        api_proxy_token=$(jq -r '.api_proxy_token // empty' <<<"${tokens_json}")
+        credential_proxy_token=$(jq -r '.credential_proxy_token // empty' <<<"${tokens_json}")
+        api_proxy_url=$(jq -r '.api_proxy_url // empty' <<<"${caps_json}")
         # Validate the providers array shape AND each element against the
         # allowlist via jq before joining. jq -e exits non-zero on the
         # `error()` call, which trips `set -e`. Using jq (not bash regex)
@@ -85,7 +95,7 @@ runs:
               )
             | join(",")
           end
-        ' "${CAPS_FILE}") || {
+        ' <<<"${caps_json}") || {
           echo "::error::Invalid providers in capabilities.json (allowlist: anthropic / openai / google per credential-isolation.md §2.4)"
           exit 1
         }
@@ -163,6 +173,17 @@ runs:
         COFFREE_SERVER_URL: ${{ inputs.server_url }}
       run: |
         set -euo pipefail
+
+        # Validate server_url shape. spec auth/overview.md and
+        # gha-runtime.md §4.4 both require "scheme + host with no trailing
+        # slash" so the OIDC `audience` claim and the download URL stay
+        # intact. This is the first step that uses server_url so we
+        # fail-fast here and skip re-validation in subsequent steps.
+        server_url_re='^https?://[A-Za-z0-9.-]+(:[0-9]+)?$'
+        if [[ ! ${COFFREE_SERVER_URL} =~ ${server_url_re} ]]; then
+          echo "::error::server_url must be scheme+host with no path / no trailing slash (e.g. https://coffree.example.com): ${COFFREE_SERVER_URL}"
+          exit 1
+        fi
 
         # Architecture detection per gha-runtime.md §4.1.
         case "$(uname -m)" in
@@ -355,11 +376,19 @@ runs:
           }
 
           if [ "${http_status}" = "200" ]; then
-            job_token=$(jq -r '.job_token // empty' < "${response_file}")
-            if [ -z "${job_token}" ]; then
-              echo "::error::exchange-token returned 200 but the body did not contain 'job_token'."
+            # jq -e enforces JWT shape (header.payload.signature with
+            # base64url chars only). If the value is malformed (newline /
+            # shell metachar) or absent, jq exits non-zero and trips
+            # `set -e`; the explicit `||` handler turns it into a clear
+            # error message. This blocks newline injection from a malformed
+            # 200 response into $GITHUB_ENV.
+            job_token=$(jq -er '
+              .job_token
+              | select(type == "string" and test("^[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+$"))
+            ' < "${response_file}") || {
+              echo "::error::exchange-token returned 200 but the body did not contain a valid base64url JWT job_token."
               exit 1
-            fi
+            }
             break
           fi
 
@@ -684,21 +713,28 @@ runs:
         # failed before producing it.
         shim_dir=""
         if [ -f "${COFFREE_SHIM_DIR_FILE}" ]; then
-          shim_dir=$(cat "${COFFREE_SHIM_DIR_FILE}")
+          recorded=$(cat "${COFFREE_SHIM_DIR_FILE}")
           # Validate strictly: parent must equal $RUNNER_TEMP, basename
           # must match coffree-shims-<alnum> (the mktemp -d template). A
           # plain prefix `case` would accept path traversal like
           # ${RUNNER_TEMP}/coffree-shims-x/../etc, so we split parent +
-          # basename via bash parameter expansion and compare each.
-          shim_parent="${shim_dir%/*}"
-          shim_base="${shim_dir##*/}"
+          # basename via bash parameter expansion and compare each. The
+          # directory existence check is decoupled from the validation so
+          # the helper unset below still fires even if the dir is already
+          # gone (Run coffree may have removed it on success).
+          shim_parent="${recorded%/*}"
+          shim_base="${recorded##*/}"
           base_re='^coffree-shims-[A-Za-z0-9]+$'
-          if [ "${shim_parent}" = "${RUNNER_TEMP}" ] && [[ ${shim_base} =~ ${base_re} ]] && [ -d "${shim_dir}" ]; then
-            rm -rf -- "${shim_dir}"
-            echo "[cleanup] removed shim dir ${shim_dir}"
+          if [ "${shim_parent}" = "${RUNNER_TEMP}" ] && [[ ${shim_base} =~ ${base_re} ]]; then
+            shim_dir="${recorded}"
+            if [ -d "${shim_dir}" ]; then
+              rm -rf -- "${shim_dir}"
+              echo "[cleanup] removed shim dir ${shim_dir}"
+            else
+              echo "[cleanup] shim dir already absent: ${shim_dir}"
+            fi
           else
-            echo "[cleanup] refusing to remove unrecognised shim dir: ${shim_dir}"
-            shim_dir=""
+            echo "[cleanup] refusing to remove unrecognised shim dir: ${recorded}"
           fi
           rm -f -- "${COFFREE_SHIM_DIR_FILE}"
         else
